@@ -80,14 +80,16 @@ mark_temp_files({
 
 ## HTTP 接口
 
-两个同源 POST 路由，客户端按钮用它们和 Host 通信：
+两条 **exact Fetch 路由**，挂在 DSH 已认证的 `/api` 通道上：
 
 | 路由 | 请求 | 响应 |
 | --- | --- | --- |
-| `/session-temp-reaper/scan` | `{ sessionId }` | `{ cwd, items[] }` |
-| `/session-temp-reaper/delete` | `{ sessionId, paths[] }` | `{ results[], removed }` |
+| `POST /api/session-temp-reaper/scan` | `{ sessionId }` | `{ cwd, items[], profileKnown }` |
+| `POST /api/session-temp-reaper/delete` | `{ sessionId, paths[] }` | `{ results[], removed }` |
 
-扫描结果在 Host 内存里缓存 10 分钟；删除只接受「该会话最近一次扫描里出现过的路径」，跨会话、凭空构造的路径一律拒绝。
+认证由 DSH 的 `connection` 层负责：请求先过 Host/Origin 栅栏与浏览器（或 API peer）凭据校验，未认证直接 401，非 owner principal 403，只有通过后才进入插件 handler。插件自己不实现认证，也拿不到裸 socket。无凭据的本地 `curl` 打不动这两条路由。
+
+扫描结果在 Host 内存里缓存 10 分钟、上限 64 条；删除只接受「该会话最近一次扫描里出现过的路径」，跨会话、凭空构造的路径一律拒绝。
 
 ## 测试
 
@@ -95,7 +97,7 @@ mark_temp_files({
 npm test        # 等价于 node test/probe.mjs
 ```
 
-`test/probe.mjs` 是纯 Node、零外部依赖的行为探针：用假 ctx 驱动真实 `apply()`，在系统临时目录里建沙盒，跑完自动清理。覆盖路由方法/来源/体积校验、标记与默认勾选、Host 侧保护拒删、`.git` 与越界拒绝、删除后缓存失效、扫描缓存 LRU 淘汰、标记工具过滤与渲染、profile 不可定位时的提示、系统提示段注册。
+`test/probe.mjs` 是纯 Node、零外部依赖的行为探针：用假 ctx 驱动真实 `apply()`，在系统临时目录里建沙盒，跑完自动清理。覆盖路由注册（`/api` 前缀、仅 POST、无裸 `webServer` 路由）、方法与请求体校验、标记与默认勾选、Host 侧保护拒删、`.git` 与越界拒绝、删除后缓存失效、扫描缓存 LRU 淘汰、标记工具过滤与渲染、profile 不可定位时的提示、系统提示段注册。
 
 ## 安全边界
 
@@ -129,7 +131,7 @@ npm test        # 等价于 node test/probe.mjs
 - 只写在 `cordis.patch.yml` 里、没进 profile `dependencies` 的包，识别不出「正在使用」
 - 定位不到 profile 时，面板顶部会警告「无法确认插件依赖」，此时不假装保护生效
 - 删除不可恢复，没有回收站
-- HTTP 路由未接 DSH 认证层，只适合回环访问（见仓库 issue / 交接文档 TMP-01）
+- 路由挂在 `/api` 认证通道上，因此需要 DSH 的 Web 载体；纯 CLI 环境里按钮不出现
 
 ## 目录结构
 

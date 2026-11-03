@@ -450,7 +450,9 @@ window.__ModuleLoader__.load({
     async function scanSession(sessionId) {
       store.set({ phase: 'loading', error: null, results: null, armed: false, items: [], drop: {}, profileKnown: true });
       try {
-        const { status, body } = await post('/session-temp-reaper/scan', { sessionId });
+        // Exact Fetch routes on DSH's authenticated /api channel: the browser
+        // cookie is checked by the Host before the handler runs.
+        const { status, body } = await post('/api/session-temp-reaper/scan', { sessionId });
         if (status !== 200 || body === null || body.ok !== true) {
           store.set({ phase: 'error', error: tr('error.scan') });
           return;
@@ -548,7 +550,7 @@ window.__ModuleLoader__.load({
       }
       store.set({ busy: true, error: null });
       try {
-        const { status, body } = await post('/session-temp-reaper/delete', {
+        const { status, body } = await post('/api/session-temp-reaper/delete', {
           sessionId: state.sessionId,
           paths,
         });

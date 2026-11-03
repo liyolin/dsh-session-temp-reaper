@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply } from '../index.js';
 
-export const ROUTE = '/session-temp-reaper';
+export const ROUTE = '/api/session-temp-reaper';
 export const HOUR = 60 * 60 * 1000;
 export const MIN = 60 * 1000;
 
@@ -64,17 +64,26 @@ export async function exists(path) {
 
 export function mount({ sessions, sessionId, cwd, createdAt, events }) {
     const known = sessions ?? new Map([[sessionId, { cwd, createdAt, events }]]);
-    const state = { routes: new Map(), tool: null, section: null, reads: new Map() };
+    const state = { fetchRoutes: new Map(), tool: null, section: null, reads: new Map() };
     const host = {
         effect(fn) {
             const disposer = fn();
             state.disposer = disposer;
             return disposer;
         },
-        webServer: {
-            register(spec) {
-                state.routes.set(spec.path, spec.handler);
-                return () => state.routes.delete(spec.path);
+        // Exact Fetch routes on the authenticated `/api` channel. The fake only
+        // records them; the real bridge does Host/Origin checks and peer auth
+        // before calling `fetch`, which is exactly why the plugin no longer
+        // carries its own authentication.
+        connection: {
+            fetch: {
+                register(route) {
+                    if (state.fetchRoutes.has(route.path)) throw new Error(`duplicate route ${route.path}`);
+                    state.fetchRoutes.set(route.path, route);
+                    return async () => {
+                        state.fetchRoutes.delete(route.path);
+                    };
+                },
             },
         },
         sessionQuery: {
@@ -109,40 +118,29 @@ export function mount({ sessions, sessionId, cwd, createdAt, events }) {
     return state;
 }
 
-/** POST to a captured route, returning parsed JSON and the status code. */
-export async function call(state, route, { method = 'POST', body, origin, raw } = {}) {
-    const handler = state.routes.get(route);
-    if (handler === undefined) throw new Error(`route not registered: ${route}`);
+/**
+ * Call one registered exact Fetch route, returning parsed JSON and status.
+ * `path` is the full browser path, for example `/api/session-temp-reaper/scan`.
+ */
+export async function call(state, path, { method = 'POST', body, raw } = {}) {
+    const route = state.fetchRoutes.get(path);
+    if (route === undefined) throw new Error(`route not registered: ${path}`);
     const payload = raw !== undefined ? raw : body === undefined ? '' : JSON.stringify(body);
-    const request = {
+    const request = new Request(`http://127.0.0.1:2465${path}`, {
         method,
-        headers: { host: '127.0.0.1:2465' },
-        async *[Symbol.asyncIterator]() {
-            if (payload !== '') yield Buffer.from(payload, 'utf8');
-        },
-    };
-    if (origin !== undefined) request.headers.origin = origin;
-    const response = {
-        status: 0,
-        headers: {},
-        text: '',
-        writeHead(status, headers) {
-            this.status = status;
-            Object.assign(this.headers, headers ?? {});
-        },
-        end(text) {
-            this.text = text ?? '';
-        },
-    };
-    await handler(request, response);
+        headers: payload === '' ? {} : { 'content-type': 'application/json' },
+        body: payload === '' ? undefined : payload,
+    });
+    const response = await route.fetch(request);
+    const text = await response.text();
     let json = null;
     try {
-        json = response.text === '' ? null : JSON.parse(response.text);
+        json = text === '' ? null : JSON.parse(text);
     }
     catch {
-        json = { unparsable: response.text };
+        json = { unparsable: text };
     }
-    return { status: response.status, json };
+    return { status: response.status, json, route };
 }
 
 /** Sandbox plus a scan/delete pair wired to one session id. */

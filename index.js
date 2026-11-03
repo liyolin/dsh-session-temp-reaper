@@ -47,7 +47,7 @@ import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'no
 export const name = 'session-temp-reaper';
 
 /** Route prefix owned by this plugin; a composition-level contract. */
-const ROUTE = '/session-temp-reaper';
+const ROUTE = '/api/session-temp-reaper';
 
 /** Tool names whose arguments name one written path. */
 const WRITE_TOOLS = new Set(['write', 'edit']);
@@ -957,37 +957,6 @@ function cachedScan(sessionId) {
     return record;
 }
 
-function sendJson(response, status, body) {
-    response.writeHead(status, {
-        'content-type': 'application/json; charset=utf-8',
-        'cache-control': 'no-store',
-    });
-    response.end(JSON.stringify(body));
-}
-
-function sameOrigin(request) {
-    const origin = request.headers.origin;
-    if (typeof origin !== 'string' || origin === '') return true;
-    try {
-        return new URL(origin).host === request.headers.host;
-    }
-    catch {
-        return false;
-    }
-}
-
-async function readJsonBody(request) {
-    const chunks = [];
-    let bytes = 0;
-    for await (const chunk of request) {
-        bytes += chunk.length;
-        if (bytes > 1_000_000) throw new Error('request body too large');
-        chunks.push(chunk);
-    }
-    if (bytes === 0) return {};
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
-}
-
 /**
  * Remove requested paths, keeping only ones this plugin offered for that
  * session. Returns one entry per requested path.
@@ -1052,46 +1021,61 @@ async function removeFiles(sessionQuery, sessionId, requested) {
     return { results, removed };
 }
 
+/** Requests are small JSON envelopes; anything bigger is a mistake or an attack. */
+const MAX_BODY_CHARS = 1_000_000;
+
+async function readJson(request) {
+    const text = await request.text();
+    if (text.length > MAX_BODY_CHARS) throw new Error('request body too large');
+    if (text === '') return {};
+    return JSON.parse(text);
+}
+
+function jsonResponse(status, body) {
+    return new Response(JSON.stringify(body), {
+        status,
+        headers: {
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store',
+        },
+    });
+}
+
 /**
- * Register the two routes. Both are registered through `webServer`, which only
- * exists in a profile that serves the Web GUI; elsewhere the plugin stays dark
- * instead of throwing.
+ * Register the two routes as exact Fetch routes on DSH's authenticated `/api`
+ * channel. The bridge checks Host/Origin and the browser or API credential
+ * before any byte is read, and only an owner Peer reaches the handler, so this
+ * plugin carries no authentication of its own. Registration fails loudly if the
+ * channel rejects a path, which is better than silently serving an open route.
  */
 export function apply(ctx) {
-    ctx.inject(['webServer', 'sessionQuery'], (host) => {
+    ctx.inject(['connection', 'sessionQuery'], (host) => {
         host.effect(() => {
-            const route = (path, handle) => host.webServer.register({
-                kind: 'exact',
+            const route = (path, handle) => host.connection.fetch.register({
                 path,
-                handler: async (request, response) => {
+                methods: ['POST'],
+                requestBody: 'buffered',
+                fetch: async (request) => {
                     if (request.method !== 'POST') {
-                        response.writeHead(405, { allow: 'POST' });
-                        response.end();
-                        return;
-                    }
-                    if (!sameOrigin(request)) {
-                        sendJson(response, 403, { ok: false, code: 'origin' });
-                        return;
+                        return new Response(null, { status: 405, headers: { allow: 'POST' } });
                     }
                     let body;
                     try {
-                        body = await readJsonBody(request);
+                        body = await readJson(request);
                     }
                     catch (error) {
-                        sendJson(response, 400, { ok: false, code: 'bad-request', error: String(error?.message ?? error) });
-                        return;
+                        return jsonResponse(400, { ok: false, code: 'bad-request', error: String(error?.message ?? error) });
                     }
                     const sessionId = body?.sessionId;
                     if (!validSessionId(sessionId)) {
-                        sendJson(response, 400, { ok: false, code: 'invalid-session' });
-                        return;
+                        return jsonResponse(400, { ok: false, code: 'invalid-session' });
                     }
                     try {
                         const result = await handle(sessionId, body);
-                        sendJson(response, 200, { ok: true, ...result });
+                        return jsonResponse(200, { ok: true, ...result });
                     }
                     catch (error) {
-                        sendJson(response, 500, {
+                        return jsonResponse(500, {
                             ok: false,
                             code: 'scan-failed',
                             error: String(error?.message ?? error),
@@ -1112,9 +1096,9 @@ export function apply(ctx) {
             ];
             return () => {
                 scans.clear();
-                for (const dispose of disposers) dispose();
+                for (const dispose of disposers) void dispose();
             };
-        }, 'session-temp-reaper: http routes');
+        }, 'session-temp-reaper: api routes');
     });
 
     // The model defines "temporary" for this session by calling the marker; the

@@ -26,26 +26,33 @@ import {
     test,
 } from './harness.mjs';
 
-// ── routes ────────────────────────────────────────────────────────────────────
+// ── routes on the authenticated /api channel ─────────────────────────────────
 
-// ── routes ────────────────────────────────────────────────────────────────────
-
-await test('both routes are registered', async () => {
+await test('both routes are registered on the /api channel, POST only', async () => {
     const box = await sandbox([]);
     try {
-        assert(box.state.routes.has(`${ROUTE}/scan`), 'scan route missing');
-        assert(box.state.routes.has(`${ROUTE}/delete`), 'delete route missing');
+        for (const suffix of ['scan', 'delete']) {
+            const route = box.state.fetchRoutes.get(`${ROUTE}/${suffix}`);
+            assert(route !== undefined, `${suffix} route missing`);
+            eq(route.path, `${ROUTE}/${suffix}`, `${suffix} path`);
+            // The Fetch bridge only accepts paths under /api; anything else
+            // would fail registration upstream.
+            assert(route.path.startsWith('/api/'), `${suffix} must live under /api`);
+            eq(route.methods.join(','), 'POST', `${suffix} methods`);
+            eq(route.requestBody, 'buffered', `${suffix} requestBody`);
+        }
     }
     finally {
         await box.cleanup();
     }
 });
 
-await test('GET is rejected with 405', async () => {
+await test('the plugin registers no unauthenticated webServer route', async () => {
     const box = await sandbox([]);
     try {
-        const { status } = await call(box.state, `${ROUTE}/scan`, { method: 'GET' });
-        eq(status, 405, 'GET status');
+        // `mount` exposes no webServer service at all: if the plugin still
+        // reached for one, `apply()` would have thrown during mount.
+        eq(box.state.fetchRoutes.size, 2, 'exactly two Fetch routes');
     }
     finally {
         await box.cleanup();
@@ -64,28 +71,12 @@ await test('missing sessionId is rejected with 400', async () => {
     }
 });
 
-await test('cross-origin request is rejected with 403', async () => {
+await test('a non-JSON body is rejected with 400', async () => {
     const box = await sandbox([]);
     try {
-        const { status } = await call(box.state, `${ROUTE}/scan`, {
-            body: { sessionId: box.sessionId },
-            origin: 'https://evil.example',
-        });
-        eq(status, 403, 'status');
-    }
-    finally {
-        await box.cleanup();
-    }
-});
-
-await test('same-origin request is accepted', async () => {
-    const box = await sandbox([]);
-    try {
-        const { status } = await call(box.state, `${ROUTE}/scan`, {
-            body: { sessionId: box.sessionId },
-            origin: 'http://127.0.0.1:2465',
-        });
-        eq(status, 200, 'status');
+        const { status, json } = await call(box.state, `${ROUTE}/scan`, { raw: 'not json' });
+        eq(status, 400, 'status');
+        eq(json.code, 'bad-request', 'code');
     }
     finally {
         await box.cleanup();

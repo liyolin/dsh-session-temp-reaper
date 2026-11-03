@@ -79,14 +79,16 @@ Marks exist only as a `tool/call` entry in the session log, so they travel with 
 
 ## HTTP routes
 
-Two same-origin POST routes connect the client button to the host:
+Two **exact Fetch routes** on DSH's authenticated `/api` channel:
 
 | Route | Body | Response |
 | --- | --- | --- |
-| `/session-temp-reaper/scan` | `{ sessionId }` | `{ cwd, items[] }` |
-| `/session-temp-reaper/delete` | `{ sessionId, paths[] }` | `{ results[], removed }` |
+| `POST /api/session-temp-reaper/scan` | `{ sessionId }` | `{ cwd, items[], profileKnown }` |
+| `POST /api/session-temp-reaper/delete` | `{ sessionId, paths[] }` | `{ results[], removed }` |
 
-Scan results are cached in host memory for 10 minutes. Delete accepts only paths that appeared in that session's latest scan; anything else is rejected per path.
+Authentication belongs to DSH's `connection` layer: Host/Origin fencing and the browser (or API peer) credential are checked before the handler runs, with 401 for unauthenticated requests and 403 for a non-owner principal. The plugin implements no authentication of its own and never sees a raw socket, so a local `curl` without credentials cannot reach these routes.
+
+Scan results are cached in host memory for 10 minutes, at most 64 entries. Delete accepts only paths that appeared in that session's latest scan; anything else is rejected per path.
 
 ## Tests
 
@@ -94,7 +96,7 @@ Scan results are cached in host memory for 10 minutes. Delete accepts only paths
 npm test        # same as node test/probe.mjs
 ```
 
-`test/probe.mjs` is a behaviour probe with no external dependencies: it drives the real `apply()` with a fake context, builds a sandbox in the OS temp directory, and cleans up afterwards. It covers route method/origin/size validation, marking and default selection, the host-side refusal to delete protected files, `.git` and out-of-root rejections, cache invalidation after a delete, LRU eviction of the scan cache, marker-tool filtering and rendering, the undiscoverable-profile warning, and prompt-section registration.
+`test/probe.mjs` is a behaviour probe with no external dependencies: it drives the real `apply()` with a fake context, builds a sandbox in the OS temp directory, and cleans up afterwards. It covers route registration (the `/api` prefix, POST only, no bare `webServer` route), method and body validation, marking and default selection, the host-side refusal to delete protected files, `.git` and out-of-root rejections, cache invalidation after a delete, LRU eviction of the scan cache, marker-tool filtering and rendering, the undiscoverable-profile warning, and prompt-section registration.
 
 ## Safety boundaries
 
@@ -128,7 +130,7 @@ The event window covers the last 72 hours of the session log; the workspace walk
 - Packages referenced only in `cordis.patch.yml` (not in profile `dependencies`) are not recognised as "in use"
 - When the profile cannot be located the panel warns that plugin dependencies could not be checked instead of pretending the protection is active
 - Deletion is permanent; there is no trash
-- The HTTP routes are not wired into the DSH auth layer, so they are for loopback use only (see TMP-01 in the handover notes)
+- The routes live on the `/api` authenticated channel, so they need DSH's Web carrier; without it the button does not appear
 
 ## Layout
 
