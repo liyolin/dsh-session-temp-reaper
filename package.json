@@ -4,14 +4,14 @@
   "type": "module",
   "description": "Adds a composer button that lists the files this session created and deletes the ones the user does not keep.",
   "license": "MIT",
-  "author": "Kaalia0912 <Kaalia0912@users.noreply.github.com>",
+  "author": "liyolin <liyolin@users.noreply.github.com>",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Kaalia0912/dsh-session-temp-reaper.git"
+    "url": "git+https://github.com/liyolin/dsh-session-temp-reaper.git"
   },
-  "homepage": "https://github.com/Kaalia0912/dsh-session-temp-reaper#readme",
+  "homepage": "https://github.com/liyolin/dsh-session-temp-reaper#readme",
   "bugs": {
-    "url": "https://github.com/Kaalia0912/dsh-session-temp-reaper/issues"
+    "url": "https://github.com/liyolin/dsh-session-temp-reaper/issues"
   },
   "keywords": [
     "dsh",

@@ -45,7 +45,7 @@ npm install --save "link:<本项目绝对路径>"
 
 ```bash
 cd ~/.dsh/profiles/desktop
-npm install --save "github:Kaalia0912/dsh-session-temp-reaper"
+npm install --save "github:liyolin/dsh-session-temp-reaper"
 ```
 
 同样记得把包名加进 `dsh.profile.bundles`。

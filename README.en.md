@@ -44,7 +44,7 @@ Then add `"dsh-session-temp-reaper"` to the `dsh.profile.bundles` array in the s
 
 ```bash
 cd ~/.dsh/profiles/desktop
-npm install --save "github:Kaalia0912/dsh-session-temp-reaper"
+npm install --save "github:liyolin/dsh-session-temp-reaper"
 ```
 
 Add the package name to `dsh.profile.bundles` as well.
