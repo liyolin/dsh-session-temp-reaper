@@ -1248,7 +1248,10 @@ export function apply(ctx) {
                 + 'a log, a cache, a one-off output), call `mark_temp_files` with its path(s) right away. '
                 + 'Do not mark deliverables, files the user asked to keep, or existing source files you '
                 + 'edited. The user can review and delete the marked files from the cleanup button beside '
-                + 'the composer; unmarked files are not offered for deletion by default.\n',
+                + 'the composer; unmarked files are not offered for deletion by default.\n'
+                + 'When the user asks which files from this session can be deleted, answer briefly and then '
+                + 'call `mark_temp_files` with the paths you judge safe to delete in the same turn; the call '
+                + 'only records marks and deletes nothing.\n',
         }), 'session-temp-reaper: prompt section');
     });
 }
