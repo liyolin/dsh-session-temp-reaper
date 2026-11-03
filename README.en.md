@@ -98,7 +98,7 @@ The request body is capped at 1 MB and checked while it is read: an oversized bo
 npm test        # same as node test/probe.mjs
 ```
 
-`test/probe.mjs` is a behaviour probe with no external dependencies: it drives the real `apply()` with a fake context, builds a sandbox in the OS temp directory, and cleans up afterwards. It covers route registration (the `/api` prefix, POST only, no bare `webServer` route), method and body validation (including an oversized streamed body that must be abandoned mid-read), marking and default selection, the host-side refusal to delete protected files, `.git` and out-of-root rejections, cache invalidation after a delete, LRU eviction of the scan cache, the session-cwd cache bound and its release on unload, marker-tool filtering and rendering, the undiscoverable-profile warning, `package.json` shipping the `test` directory, and prompt-section registration.
+`test/probe.mjs` is a behaviour probe with no external dependencies: it drives the real `apply()` with a fake context, builds a sandbox in the OS temp directory, and cleans up afterwards. It covers route registration (the `/api` prefix, POST only, no bare `webServer` route), method and body validation (including an oversized streamed body that must be abandoned mid-read), marking and default selection, the host-side refusal to delete protected files, `.git` and out-of-root rejections, cache invalidation after a delete, LRU eviction of the scan cache, the session-cwd cache bound and its release on unload, cross-session isolation (another session's files and another session's `.dsh-tmp` never appear), `session_temp_dir` creation and idempotence, marker-tool filtering and rendering, the undiscoverable-profile warning, `package.json` shipping the `test` directory, and prompt-section registration.
 
 ## Safety boundaries
 
@@ -115,20 +115,32 @@ npm test        # same as node test/probe.mjs
 
 ## Scan sources (the unmarked group)
 
+Attribution is strict: **only paths this session's log names, plus this session's own scratch folder**.
+
 | Source | Meaning |
 | --- | --- |
+| `marked` | Files the model marked with `mark_temp_files` (highest priority, read from the whole log) |
 | `session` | Files the model wrote with `write` / `edit` |
 | `command` | Paths a command named explicitly (redirects, `Set-Content`, ...) |
-| `scan` | Created within 15 minutes after one of this session's shell commands, or appeared in the workspace root after the session started — attribution unconfirmed |
+| `session-dir` | Files inside this session's private scratch folder `.dsh-tmp/<first 8 of the session id>/` |
 | `external` | Files a command wrote under the OS temp root |
 | `spill` | This session's `dsh-spill-*` directory, listed as one entry |
 
-The event window covers the last 72 hours of the session log; the workspace walk is capped at 1500 files, 20000 entries and depth 12, skipping `node_modules`, `dist`, `.git` and friends.
+**The time-window sources are gone.** Inferring ownership from "created within 15 minutes of a command" or "appeared in the root after the session started" is what pulled other sessions' and other programs' output into the panel. The cost: a file a program generates without naming it in the log is listed only if it lands in this session's scratch folder.
+
+Another session's `.dsh-tmp/<their id>/` is never listed. The event window covers the last 72 hours of the session log; the scratch-folder walk is capped at 1500 files, 20000 entries and depth 12, skipping `node_modules`, `dist`, `.git` and friends.
+
+## Session isolation
+
+- The `session_temp_dir` tool returns and creates `<workspace>/.dsh-tmp/<first 8 of the session id>/`; the prompt section tells the model to write scratch there
+- Files in that folder count as this session's work without being named in the log (listed, markable, deletable)
+- The folder sits inside the workspace, so Node still finds `node_modules` upward and git still finds `.git`; **Python's `sys.path[0]` becomes that subfolder**, so importing a module from outside it needs `PYTHONPATH` or an install
+- Only new scratch is affected; existing files and configuration stay where they are. Adding `.dsh-tmp/` to the workspace `.gitignore` is recommended
 
 ## Known limits
 
 - If the model never calls `mark_temp_files`, the marked group is empty — only the unmarked group remains, and nothing is deleted by default
-- When concurrent sessions write into the same workspace, `scan`-sourced entries are guessed from a time window and carry an "unconfirmed" badge
+- A file a command generates dynamically and never writes into `.dsh-tmp` will not be listed (the price of isolation)
 - Packages referenced only in `cordis.patch.yml` (not in profile `dependencies`) are not recognised as "in use"
 - When the profile cannot be located the panel warns that plugin dependencies could not be checked instead of pretending the protection is active
 - Deletion is permanent; there is no trash
@@ -137,7 +149,7 @@ The event window covers the last 72 hours of the session log; the workspace walk
 ## Layout
 
 ```
-index.js            host side: scan, delete, mark_temp_files tool, prompt section
+index.js            host side: scan, delete, mark_temp_files / session_temp_dir tools, prompt section
 client.js           browser side: button, panel, i18n
 cordis.patch.yml    patch that inserts this bundle into a profile
 locale/             plugin metadata, zh and en

@@ -8,9 +8,9 @@
 // covered by an automated probe yet.
 delete process.env.DSH_PROFILE_DIR;
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import {
     HOUR,
     MIN,
@@ -20,6 +20,7 @@ import {
     call_,
     eq,
     exists,
+    mount,
     sandbox,
     sandboxMany,
     summary,
@@ -288,7 +289,7 @@ await test('a non-spill directory is refused with not-a-spill-dir', async () => 
 await test('marker tool ignores .git paths and empty strings', async () => {
     const box = await sandbox([]);
     try {
-        const tool = box.state.tool;
+        const tool = box.state.tools.get('mark_temp_files');
         assert(tool !== null, 'tool should be registered');
         const value = await tool.execute({ paths: ['a.txt', '.git/config', '', 'b.txt'] }, { agent: { id: box.sessionId } });
         assert(value.marked.includes('a.txt'), 'a.txt marked');
@@ -306,7 +307,7 @@ await test('marker tool ignores .git paths and empty strings', async () => {
 await test('TMP-05: marker tool refuses paths outside the session cwd and says why', async () => {
     const box = await sandbox([]);
     try {
-        const tool = box.state.tool;
+        const tool = box.state.tools.get('mark_temp_files');
         assert(tool !== null, 'tool should be registered');
         const outside = join(tmpdir(), 'reaper-outside-probe.txt');
         const value = await tool.execute(
@@ -327,7 +328,7 @@ await test('TMP-05: marker tool refuses paths outside the session cwd and says w
 await test('marker tool renders the mark count', async () => {
     const box = await sandbox([]);
     try {
-        const tool = box.state.tool;
+        const tool = box.state.tools.get('mark_temp_files');
         const rendered = tool.output.render({}, { marked: ['a', 'b'], ignored: [] });
         eq(rendered[0].text, 'Marked 2 temporary file(s).', 'render text');
     }
@@ -412,7 +413,7 @@ await test('N2: the session cwd cache is dropped when the plugin unloads', async
     // used by an earlier probe would start warm.
     const box = await sandbox([], { sessionId: 'session-n2-unload-001' });
     try {
-        const tool = box.state.tool;
+        const tool = box.state.tools.get('mark_temp_files');
         assert(tool !== null, 'tool should be registered');
         const exec = { agent: { id: box.sessionId } };
         await tool.execute({ paths: ['a.txt'] }, exec);
@@ -432,7 +433,7 @@ await test('N2: the session cwd cache is dropped when the plugin unloads', async
 await test('N2: the session cwd cache does not grow without bound', async () => {
     const box = await sandboxMany(70);
     try {
-        const tool = box.state.tool;
+        const tool = box.state.tools.get('mark_temp_files');
         assert(tool !== null, 'tool should be registered');
         for (const id of box.ids) await tool.execute({ paths: ['x.txt'] }, { agent: { id } });
         eq(box.reads(box.ids[0]), 1, 'first mark reads that session once');
@@ -490,6 +491,121 @@ await test('N5: the package ships the test files its test script needs', async (
     const pkg = JSON.parse(raw);
     if (typeof pkg.scripts?.test === 'string') {
         assert(pkg.files.includes('test'), 'files must include "test" because scripts.test runs it');
+    }
+});
+
+// ── session isolation ───────────────────────────────────────────────────────
+
+/** A throwaway workspace; the caller removes it. */
+function mkdtempSafe() {
+    return mkdtemp(join(tmpdir(), 'reaper-probe-'));
+}
+
+await test('a file another session wrote in the same workspace is not listed', async () => {
+    const cwd = await mkdtempSafe();
+    const now = Date.now();
+    const sessions = new Map([
+        ['session-iso-a', {
+            cwd,
+            createdAt: now - HOUR,
+            events: [call_('write', { path: join(cwd, 'a.txt') }, now - 10 * MIN)],
+        }],
+        ['session-iso-b', {
+            cwd,
+            createdAt: now - HOUR,
+            events: [call_('write', { path: join(cwd, 'b.txt') }, now - 10 * MIN)],
+        }],
+    ]);
+    await writeFile(join(cwd, 'a.txt'), 'a', 'utf8');
+    await writeFile(join(cwd, 'b.txt'), 'b', 'utf8');
+    const state = mount({ sessions });
+    try {
+        const { json } = await call(state, `${ROUTE}/scan`, { body: { sessionId: 'session-iso-a' } });
+        const names = json.items.map((item) => item.display);
+        assert(names.includes('a.txt'), 'this session\'s own file is listed');
+        assert(!names.includes('b.txt'), 'the other session\'s file must not be listed');
+    }
+    finally {
+        await rm(cwd, { recursive: true, force: true });
+    }
+});
+
+await test('a file that appeared after the session started but nobody named is not listed', async () => {
+    const box = await sandbox([]);
+    try {
+        // Older behaviour attributed this by timestamp alone, which is exactly
+        // how another session's output leaked into the panel.
+        await writeFile(join(box.cwd, 'stray.txt'), 'x', 'utf8');
+        const { json } = await box.scan();
+        assert(!json.items.some((item) => item.display === 'stray.txt'), 'stray root file must not be listed');
+    }
+    finally {
+        await box.cleanup();
+    }
+});
+
+await test('the session temp dir is listed even when the log never names the file', async () => {
+    const box = await sandbox([]);
+    try {
+        const tool = box.state.tools.get('session_temp_dir');
+        assert(tool !== undefined, 'session_temp_dir tool should be registered');
+        const dir = await tool.execute({}, { agent: { id: box.sessionId } });
+        const file = join(dir, 'scratch.txt');
+        await writeFile(file, 'x', 'utf8');
+        const { json } = await box.scan();
+        const item = json.items.find((entry) => entry.path === file);
+        assert(item !== undefined, 'temp-dir file is listed');
+        eq(item.source, 'session-dir', 'source');
+    }
+    finally {
+        await box.cleanup();
+    }
+});
+
+await test("another session's temp dir is never listed, even when the log names it", async () => {
+    const now = Date.now();
+    // A write event that points into a *different* session's scratch folder: the
+    // filter must drop it rather than trusting the log blindly.
+    const box = await sandbox((cwd) => [
+        call_('write', { path: join(cwd, '.dsh-tmp', 'deadbeef', 'theirs.txt') }, now - 10 * MIN),
+    ]);
+    try {
+        const other = join(box.cwd, '.dsh-tmp', 'deadbeef');
+        await mkdir(other, { recursive: true });
+        const file = join(other, 'theirs.txt');
+        await writeFile(file, 'x', 'utf8');
+        const { json } = await box.scan();
+        assert(!json.items.some((item) => item.path === file), 'other session dir must be excluded');
+    }
+    finally {
+        await box.cleanup();
+    }
+});
+
+await test('session_temp_dir is per session, inside the workspace, and idempotent', async () => {
+    const cwd = await mkdtempSafe();
+    const now = Date.now();
+    const sessions = new Map([
+        ['session-dir-a', { cwd, createdAt: now - HOUR, events: [] }],
+        ['session-dir-b', { cwd, createdAt: now - HOUR, events: [] }],
+    ]);
+    const state = mount({ sessions });
+    try {
+        const tool = state.tools.get('session_temp_dir');
+        assert(tool !== undefined, 'session_temp_dir tool should be registered');
+        const first = await tool.execute({}, { agent: { id: 'session-dir-a' } });
+        const again = await tool.execute({}, { agent: { id: 'session-dir-a' } });
+        eq(again, first, 'same session gets the same dir');
+        assert(isAbsolute(first), 'an absolute path is returned');
+        assert(first.startsWith(cwd), 'the dir lives inside the workspace');
+        const info = await stat(first);
+        assert(info.isDirectory(), 'the dir is created');
+        const other = await tool.execute({}, { agent: { id: 'session-dir-b' } });
+        assert(other !== first, 'a different session gets a different dir');
+        assert(other.startsWith(cwd), 'the other dir lives inside the workspace');
+    }
+    finally {
+        await rm(cwd, { recursive: true, force: true });
     }
 });
 

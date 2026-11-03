@@ -15,6 +15,7 @@ export const MIN = 60 * 1000;
 
 const failed = [];
 let passed = 0;
+let sandboxCounter = 0;
 
 export async function test(name, fn) {
     try {
@@ -64,7 +65,14 @@ export async function exists(path) {
 
 export function mount({ sessions, sessionId, cwd, createdAt, events }) {
     const known = sessions ?? new Map([[sessionId, { cwd, createdAt, events }]]);
-    const state = { fetchRoutes: new Map(), tool: null, section: null, reads: new Map(), disposers: [] };
+    const state = {
+        fetchRoutes: new Map(),
+        tool: null,
+        tools: new Map(),
+        section: null,
+        reads: new Map(),
+        disposers: [],
+    };
     const host = {
         effect(fn) {
             const disposer = fn();
@@ -99,7 +107,10 @@ export function mount({ sessions, sessionId, cwd, createdAt, events }) {
         tools: {
             register(definition) {
                 state.tool = definition;
-                return () => {};
+                state.tools.set(definition.name, definition);
+                return () => {
+                    state.tools.delete(definition.name);
+                };
             },
         },
         systemPrompt: {
@@ -146,15 +157,20 @@ export async function call(state, path, { method = 'POST', body, raw } = {}) {
 }
 
 /** Sandbox plus a scan/delete pair wired to one session id. */
-export async function sandbox(events, { createdAt = Date.now() - HOUR, sessionId = 'session-probe-001' } = {}) {
+export async function sandbox(events, { createdAt = Date.now() - HOUR, sessionId } = {}) {
+    // A fresh session id per sandbox: the plugin caches a session's cwd for five
+    // minutes at module level, so reusing an id across probes would hand a test
+    // the previous sandbox's directory.
+    sandboxCounter += 1;
+    const id = sessionId ?? `session-probe-${String(sandboxCounter).padStart(3, '0')}`;
     const cwd = await mkdtemp(join(tmpdir(), 'reaper-probe-'));
-    const state = mount({ sessionId, cwd, createdAt, events: typeof events === 'function' ? events(cwd) : events });
+    const state = mount({ sessionId: id, cwd, createdAt, events: typeof events === 'function' ? events(cwd) : events });
     return {
         cwd,
         state,
-        sessionId,
-        scan: () => call(state, `${ROUTE}/scan`, { body: { sessionId } }),
-        del: (paths) => call(state, `${ROUTE}/delete`, { body: { sessionId, paths } }),
+        sessionId: id,
+        scan: () => call(state, `${ROUTE}/scan`, { body: { sessionId: id } }),
+        del: (paths) => call(state, `${ROUTE}/delete`, { body: { sessionId: id, paths } }),
         cleanup: () => rm(cwd, { recursive: true, force: true }),
     };
 }

@@ -39,7 +39,7 @@
  */
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { open, readdir, realpath, rm, stat } from 'node:fs/promises';
+import { mkdir, open, readdir, realpath, rm, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
@@ -238,6 +238,9 @@ function recentEvents(events) {
  * visible to the user in the transcript.
  */
 const MARK_TOOL = 'mark_temp_files';
+
+/** Tool that hands the model this session's private scratch folder. */
+const TEMP_DIR_TOOL = 'session_temp_dir';
 
 function markedPaths(events, cwd) {
     const marked = new Map();
@@ -485,49 +488,42 @@ const WALK_MAX_FILES = 1500;
 const WALK_MAX_ENTRIES = 20000;
 const WALK_MAX_DEPTH = 12;
 
+/** Directory (inside the workspace) holding one scratch folder per session. */
+const SESSION_DIR_ROOT = '.dsh-tmp';
+
 /**
- * Files created inside the workspace *by a command this session ran*, whatever
- * produced them. This is how a program's own output is caught: `python gen.py`
- * writes `out.tmp` without ever naming it on the command line.
+ * Short, filesystem-safe name for a session's scratch folder.
  *
- * Attribution is intentionally strict, because "new since the session started"
- * is not the same as "this session's": another Session or a background plugin
- * writes into the same workspace, and the session's own `createdAt` can predate
- * its first command. A file is only listed when its creation time falls inside
- * the window that starts at one of THIS session's shell commands.
+ * Session ids look like `session-<uuid>`; the first uuid block is enough to
+ * tell sessions apart and stays readable in a path or a terminal prompt.
  */
-const COMMAND_OUTPUT_WINDOW_MS = 15 * 60 * 1000;
-
-/** Milliseconds timestamps of every shell command this session ran. */
-function shellCommandTimes(events) {
-    const times = [];
-    for (const event of events) {
-        if (event === null || typeof event !== 'object' || event.type !== 'tool/call') continue;
-        const data = event.data;
-        if (data === null || typeof data !== 'object') continue;
-        const args = parseArguments(data.arguments);
-        if (args === null || typeof args.command !== 'string' || args.command.trim() === '') continue;
-        const time = typeof event.time === 'number' ? event.time : null;
-        if (time !== null && Number.isFinite(time)) times.push(time);
-    }
-    return times;
+function sessionDirName(sessionId) {
+    const trimmed = String(sessionId).replace(/^session-/, '').replace(/[^0-9A-Za-z]/g, '');
+    if (trimmed !== '') return trimmed.slice(0, 8);
+    return createHash('sha256').update(String(sessionId)).digest('hex').slice(0, 8);
 }
 
-/** True when `createdAt` falls in [command time, command time + window]. */
-function insideCommandWindow(createdAt, commandTimes) {
-    for (const time of commandTimes) {
-        if (createdAt >= time && createdAt <= time + COMMAND_OUTPUT_WINDOW_MS) return true;
-    }
-    return false;
+/** Absolute path of this session's private scratch folder. */
+function sessionTempDir(cwd, sessionId) {
+    return join(cwd, SESSION_DIR_ROOT, sessionDirName(sessionId));
 }
 
-async function scanNewFiles(cwd, commandTimes) {
+/** True when `target` sits inside the workspace scratch root. */
+function isInSessionDirRoot(cwd, target) {
+    return isInside(join(cwd, SESSION_DIR_ROOT), target);
+}
+
+/**
+ * Everything inside this session's own scratch folder.
+ *
+ * This is the one place where a file counts as the session's work without being
+ * named anywhere in the log: the folder is derived from the session id, so no
+ * other session can be writing into it by accident.
+ */
+async function sessionDirFiles(tempDir) {
     const found = new Map();
-    if (commandTimes.length === 0) return found;
     let visited = 0;
-    // Breadth-first, so shallow files are found before a deep sibling tree can
-    // spend the whole budget: `qq-bridge/...` must not starve `./out.tmp`.
-    const queue = [[cwd, 0]];
+    const queue = [[tempDir, 0]];
     while (queue.length > 0 && found.size < WALK_MAX_FILES && visited < WALK_MAX_ENTRIES) {
         const [dir, depth] = queue.shift();
         let entries;
@@ -535,6 +531,7 @@ async function scanNewFiles(cwd, commandTimes) {
             entries = await readdir(dir, { withFileTypes: true });
         }
         catch {
+            // Not created yet, or removed meanwhile: nothing to offer.
             continue;
         }
         for (const entry of entries) {
@@ -548,60 +545,8 @@ async function scanNewFiles(cwd, commandTimes) {
                 continue;
             }
             if (!entry.isFile()) continue;
-            let info;
-            try {
-                info = await stat(absolute);
-            }
-            catch {
-                continue;
-            }
-            const created = typeof info.birthtimeMs === 'number' && info.birthtimeMs > 0
-                ? info.birthtimeMs
-                : info.mtimeMs;
-            if (!insideCommandWindow(created, commandTimes)) continue;
-            found.set(absolute, 'scan');
+            found.set(absolute, { source: 'session-dir', origin: '' });
         }
-    }
-    return found;
-}
-
-/** Files sitting directly in the workspace root that appeared after this session
- * started, even when no command window covers them. A script the model wrote
- * itself is already an event target; this catches what a program created outside
- * every command window, which used to be dropped silently. Context only: the
- * `scan` source keeps it in the unmarked group, so it is proposed for keeping.
- *
- * @param cwd workspace root to list, non-recursively
- * @param since session header `createdAt` in ms; without it nothing is listed
- */
-const ROOT_SCAN_MAX_FILES = 200;
-
-async function recentRootFiles(cwd, since) {
-    const found = new Map();
-    if (typeof since !== 'number' || !Number.isFinite(since)) return found;
-    let entries;
-    try {
-        entries = await readdir(cwd, { withFileTypes: true });
-    }
-    catch {
-        return found;
-    }
-    for (const entry of entries) {
-        if (found.size >= ROOT_SCAN_MAX_FILES) break;
-        if (!entry.isFile()) continue;
-        const absolute = join(cwd, entry.name);
-        let info;
-        try {
-            info = await stat(absolute);
-        }
-        catch {
-            continue;
-        }
-        const created = typeof info.birthtimeMs === 'number' && info.birthtimeMs > 0
-            ? info.birthtimeMs
-            : info.mtimeMs;
-        if (created < since) continue;
-        found.set(absolute, { source: 'scan', origin: '' });
     }
     return found;
 }
@@ -876,21 +821,20 @@ async function scan(sessionQuery, sessionId) {
     // those from the window let an old deliverable lose its protection as soon
     // as the session logged anything newer.
     const events = recentEvents(allEvents);
+    const tempDir = sessionTempDir(cwd, sessionId);
     const targets = eventTargets(events, cwd);
     for (const [absolute, entry] of targets) {
-        if (isInside(cwd, absolute) && !paths.has(absolute)) paths.set(absolute, entry);
+        if (!isInside(cwd, absolute) || paths.has(absolute)) continue;
+        // A path inside the workspace scratch root but not in this session's own
+        // folder belongs to another session: never list it, even when a command
+        // happened to name it.
+        if (isInSessionDirRoot(cwd, absolute) && !isInside(tempDir, absolute)) continue;
+        paths.set(absolute, entry);
     }
-    // Files that appeared inside one of this session's command windows: a
-    // program's own output. Nothing else is attributed to the session.
-    const commandTimes = shellCommandTimes(events);
-    if (commandTimes.length > 0) {
-        for (const absolute of (await scanNewFiles(cwd, commandTimes)).keys()) {
-            if (!paths.has(absolute)) paths.set(absolute, { source: 'scan', origin: '' });
-        }
-    }
-    // Root-level files that appeared after the session started but matched no
-    // command window. Shown as context (unmarked group), never default-selected.
-    for (const [absolute, entry] of await recentRootFiles(cwd, startedAt)) {
+    // This session's private scratch folder. Contents count as the session's own
+    // work without being named anywhere: the folder is derived from the session
+    // id, so no other session can be writing into it by accident.
+    for (const [absolute, entry] of await sessionDirFiles(tempDir)) {
         if (!paths.has(absolute)) paths.set(absolute, entry);
     }
     // Explicit command targets under the OS temp root.
@@ -1156,7 +1100,9 @@ export function apply(ctx) {
     // call itself is a normal tool call, so the marks replay with the session log
     // and show up in the transcript.
     ctx.inject(['tools', 'sessionQuery'], (toolHost) => {
-        toolHost.effect(() => toolHost.tools.register({
+        toolHost.effect(() => {
+            const disposers = [];
+            disposers.push(toolHost.tools.register({
             name: MARK_TOOL,
             description: 'Mark files created during this session that are temporary or intermediate '
                 + '(scratch scripts, test files, logs, caches, one-off outputs), so the user can review '
@@ -1236,7 +1182,37 @@ export function apply(ctx) {
                 }
                 return { marked, ignored };
             },
-        }), 'session-temp-reaper: mark tool');
+            }));
+            // Scratch space: one folder per session inside the workspace, so the
+            // cleanup panel can tell this session's output from another's.
+            disposers.push(toolHost.tools.register({
+                name: TEMP_DIR_TOOL,
+                description: 'Return this session\'s private scratch folder (absolute path), creating it on '
+                    + 'first use. Write temporary or intermediate files there instead of scattering them '
+                    + 'through the workspace: everything in that folder is attributed to this session, and '
+                    + 'other sessions\' folders are never listed.',
+                parameters: {
+                    type: 'object',
+                    properties: {},
+                    required: [],
+                    additionalProperties: false,
+                },
+                output: {
+                    schema: { type: 'string' },
+                    render: (args, value) => [{ type: 'text', text: value }],
+                },
+                execute: async (args, exec) => {
+                    const cwd = await sessionCwdFor(toolHost.sessionQuery, exec?.agent?.id);
+                    if (cwd === null) throw new Error('cannot resolve this session\'s working directory');
+                    const dir = sessionTempDir(cwd, exec?.agent?.id);
+                    await mkdir(dir, { recursive: true });
+                    return dir;
+                },
+            }));
+            return () => {
+                for (const dispose of disposers) void dispose();
+            };
+        }, 'session-temp-reaper: tools');
     });
 
     ctx.inject(['systemPrompt'], (promptHost) => {
@@ -1244,8 +1220,11 @@ export function apply(ctx) {
             name: 'session-temp-reaper',
             order: 900,
             text: '## Temporary files\n'
-                + 'Whenever you create a temporary or intermediate artifact (a scratch script, a test file, '
-                + 'a log, a cache, a one-off output), call `mark_temp_files` with its path(s) right away. '
+                + 'Scratch artefacts (a scratch script, a test file, a log, a cache, a one-off output) go in '
+                + 'this session\'s private folder: call `session_temp_dir` once and write them there. That '
+                + 'folder is attributed to this session and other sessions\' folders are never listed, so a '
+                + 'file written by another conversation cannot show up as yours.\n'
+                + 'Then call `mark_temp_files` with those path(s) right away. '
                 + 'Do not mark deliverables, files the user asked to keep, or existing source files you '
                 + 'edited. The user can review and delete the marked files from the cleanup button beside '
                 + 'the composer; unmarked files are not offered for deletion by default.\n'

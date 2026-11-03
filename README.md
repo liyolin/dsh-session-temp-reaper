@@ -99,7 +99,7 @@ mark_temp_files({
 npm test        # 等价于 node test/probe.mjs
 ```
 
-`test/probe.mjs` 是纯 Node、零外部依赖的行为探针：用假 ctx 驱动真实 `apply()`，在系统临时目录里建沙盒，跑完自动清理。覆盖路由注册（`/api` 前缀、仅 POST、无裸 `webServer` 路由）、方法与请求体校验（含超大流式请求体必须中断读取）、标记与默认勾选、Host 侧保护拒删、`.git` 与越界拒绝、删除后缓存失效、扫描缓存 LRU 淘汰、会话 cwd 缓存的上限与卸载清理、标记工具过滤与渲染、profile 不可定位时的提示、`package.json` 的 `files` 必须带上 `test`、系统提示段注册。
+`test/probe.mjs` 是纯 Node、零外部依赖的行为探针：用假 ctx 驱动真实 `apply()`，在系统临时目录里建沙盒，跑完自动清理。覆盖路由注册（`/api` 前缀、仅 POST、无裸 `webServer` 路由）、方法与请求体校验（含超大流式请求体必须中断读取）、标记与默认勾选、Host 侧保护拒删、`.git` 与越界拒绝、删除后缓存失效、扫描缓存 LRU 淘汰、会话 cwd 缓存的上限与卸载清理、跨会话隔离（别的会话写的文件、别人的 `.dsh-tmp` 都不出现）、`session_temp_dir` 的创建与幂等、标记工具过滤与渲染、profile 不可定位时的提示、`package.json` 的 `files` 必须带上 `test`、系统提示段注册。
 
 ## 安全边界
 
@@ -116,20 +116,32 @@ npm test        # 等价于 node test/probe.mjs
 
 ## 扫描范围（未标记组的来源）
 
+严格归属：**只列本会话日志里点名过的路径，加上本会话自己的 scratch 目录**。
+
 | 来源 | 含义 |
 | --- | --- |
+| `marked` | 模型调用 `mark_temp_files` 标记的文件（最高优先级，来自全量日志） |
 | `session` | 模型用 `write` / `edit` 直接写的文件 |
 | `command` | 命令里显式写出的路径（重定向、`Set-Content` 等） |
-| `scan` | 文件创建时间落在本次会话某条 shell 命令之后 15 分钟窗口内，或会话开始后出现在工作区根目录 —— 归属未完全确认 |
+| `session-dir` | 本会话私有 scratch 目录 `.dsh-tmp/<会话id前8位>/` 里的文件 |
 | `external` | 命令写到 OS 临时根下的文件 |
 | `spill` | 本会话的 `dsh-spill-*` 目录，整目录列一条 |
 
-事件窗口取会话日志最后 72 小时；工作区遍历上限 1500 个文件 / 20000 个目录项 / 12 层深；跳过 `node_modules`、`dist`、`.git` 等目录。
+**不再有时间窗来源**：早期按「命令后 15 分钟」或「会话开始后出现在根目录」推断归属，会把同一工作区里别的会话/别的程序产出的文件也算进来，现已删除。代价是：程序自己生成、日志里没提名的文件，只有写进本会话 scratch 目录才会出现。
+
+其它会话的 `.dsh-tmp/<别家id>/` 一律不列。事件窗口取会话日志最后 72 小时；scratch 目录遍历上限 1500 个文件 / 20000 个目录项 / 12 层深，跳过 `node_modules`、`dist`、`.git` 等目录。
+
+## 会话隔离
+
+- 工具 `session_temp_dir` 返回并创建 `<工作区>/.dsh-tmp/<会话id前8位>/`，系统提示段要求模型把 scratch 写进去
+- 该目录里的文件无需日志提名就算本会话产物（写进去就会被列出、可标记、可删）
+- 目录在工作区内：Node 的 `node_modules`、git 的 `.git` 仍能逐级向上找到；**Python 的 `sys.path[0]` 会变成这个子目录**，`import` 同目录外的模块需要 `PYTHONPATH` 或安装
+- 只约束新写的 scratch，已有文件与配置不动；建议把 `.dsh-tmp/` 加进工作区的 `.gitignore`
 
 ## 已知限制
 
 - 模型忘了调 `mark_temp_files`，标记组就是空的 —— 这时候只剩未标记组可看，不会误删
-- 并发会话同时写同一工作区时，`scan` 来源的归属靠时间窗口推定，面板会标「未确认归属」
+- 命令动态生成、又没写进 `.dsh-tmp` 的文件不会被列出（这是隔离换来的代价）
 - 只写在 `cordis.patch.yml` 里、没进 profile `dependencies` 的包，识别不出「正在使用」
 - 定位不到 profile 时，面板顶部会警告「无法确认插件依赖」，此时不假装保护生效
 - 删除不可恢复，没有回收站
@@ -138,7 +150,7 @@ npm test        # 等价于 node test/probe.mjs
 ## 目录结构
 
 ```
-index.js            Host 侧：扫描、删除、mark_temp_files 工具、系统提示段
+index.js            Host 侧：扫描、删除、mark_temp_files / session_temp_dir 工具、系统提示段
 client.js           浏览器侧：按钮、面板、i18n
 cordis.patch.yml    往 profile 里插入这个 bundle 的 patch
 locale/             插件元信息的中英文
