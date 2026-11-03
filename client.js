@@ -35,6 +35,9 @@ window.__ModuleLoader__.load({
       '.str-row.dropping:hover{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 20%,transparent)}',
       '.str-row.dropping .str-name{text-decoration:line-through;text-decoration-thickness:1px}',
       ".str-check{flex:none;width:13px;height:13px;margin:2px 0 0;accent-color:var(--dsw-alias-brand-primary);cursor:pointer}",
+      '.str-row.locked{opacity:.62;background:color-mix(in srgb,var(--dsw-alias-bg-layer-2) 55%,transparent)}',
+      '.str-row.locked:hover{background:color-mix(in srgb,var(--dsw-alias-bg-layer-2) 55%,transparent)}',
+      '.str-row.locked .str-check{cursor:not-allowed}',
       '.str-main{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:1px}',
       '.str-line1{display:flex;align-items:center;gap:6px;min-width:0}',
       '.str-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}',
@@ -85,6 +88,14 @@ window.__ModuleLoader__.load({
         'action.cancel': '取消',
         'badge.referenced': '正在使用',
         'row.referencedHint': '属于正在使用的插件或依赖，删除会把插件弄坏',
+        'row.deliveredHint': '本会话已经交付给你的文件，不作为临时文件删除',
+        'result.protected': '已保护，未删除',
+        'result.not-offered': '不在本次扫描结果里，已跳过',
+        'result.outside': '不在会话目录、临时目录或系统临时根下，已跳过',
+        'result.git': '位于 .git 目录内，永不删除',
+        'result.not-a-spill-dir': '不是本会话的临时输出目录，不整目录删除',
+        'result.missing': '文件已不存在',
+        'result.rm': '删除失败',
         'badge.delivered': '已交付',
         'ask.delivered': '本会话已交付给用户',
         'ask.inUse': '正在被 profile 使用',
@@ -153,6 +164,14 @@ window.__ModuleLoader__.load({
         'action.cancel': 'Cancel',
         'badge.referenced': 'in use',
         'row.referencedHint': 'Belongs to a plugin or dependency this profile uses; deleting it breaks it',
+        'row.deliveredHint': 'Delivered to you by this session, so it is not deleted as temp',
+        'result.protected': 'protected, not deleted',
+        'result.not-offered': 'not part of this scan, skipped',
+        'result.outside': 'outside the session cwd, spill and temp root, skipped',
+        'result.git': 'inside .git, never deleted',
+        'result.not-a-spill-dir': 'not this session\'s spill directory, not removed as a whole',
+        'result.missing': 'already gone',
+        'result.rm': 'delete failed',
         'badge.delivered': 'delivered',
         'ask.delivered': 'already delivered to the user by this session',
         'ask.inUse': 'in use by the profile',
@@ -431,8 +450,17 @@ window.__ModuleLoader__.load({
       store.set(CLOSED);
     }
 
+    // Delivered files and files inside a plugin or dependency the profile is
+    // using are not deletable from this panel: the Host refuses them, so the
+    // checkbox is disabled rather than letting the user tick a dead path.
+    function isProtected(item) {
+      return item.delivered === true || item.referenced === true;
+    }
+
     function dropPaths(state) {
-      return state.items.filter((item) => state.drop[item.path] === true).map((item) => item.path);
+      return state.items
+        .filter((item) => state.drop[item.path] === true && !isProtected(item))
+        .map((item) => item.path);
     }
 
     /**
@@ -543,12 +571,18 @@ window.__ModuleLoader__.load({
 
     function ResultList(props) {
       const failed = props.results.filter((entry) => entry.ok !== true);
+      const describe = (entry) => {
+        if (entry.error) return String(entry.error);
+        const code = String(entry.code ?? '');
+        const label = tr('result.' + code);
+        return typeof label === 'string' && label.indexOf('result.') !== 0 ? label : code;
+      };
       return h('div', null,
         h('div', { className: 'str-sub' }, tr('done.summary', { removed: props.removed, failed: failed.length })),
         h('div', { className: 'str-list' }, failed.map((entry) => h('div', {
           key: entry.path,
           className: 'str-result fail',
-        }, entry.path, entry.error ? ' — ' + entry.error : ' — ' + String(entry.code ?? '')))));
+        }, entry.path, ' — ' + describe(entry)))));
     }
 
     // Source → badge. A source the Host grows later falls back to the neutral
@@ -578,17 +612,21 @@ window.__ModuleLoader__.load({
         // asked for, and the "ask the model" button covers "what is this file".
         const previewText = item.kind === 'dir' ? tr('meta.dirHint') : '';
         const referenced = item.referenced === true;
+        const locked = isProtected(item);
+        const lockedHint = referenced ? tr('row.referencedHint') : tr('row.deliveredHint');
         return h('label', {
           key: item.path,
-          className: dropped ? 'str-row dropping' : 'str-row',
-          title: referenced ? item.path + '\n' + tr('row.referencedHint') : item.path,
+          className: locked ? 'str-row locked' : dropped ? 'str-row dropping' : 'str-row',
+          title: locked ? item.path + '\n' + lockedHint : item.path,
         },
           h('input', {
             type: 'checkbox',
             className: 'str-check',
-            checked: dropped,
-            title: referenced ? tr('row.referencedHint') : undefined,
+            checked: dropped && !locked,
+            disabled: locked,
+            title: locked ? lockedHint : undefined,
             onChange: () => {
+              if (locked) return;
               const drop = Object.assign({}, store.get().drop);
               drop[item.path] = !dropped;
               store.set({ drop, armed: false });
@@ -705,8 +743,10 @@ window.__ModuleLoader__.load({
             type: 'button',
             className: 'str-btn',
             onClick: () => {
+              // Protected rows stay unticked: the Host refuses them, so ticking
+              // them would only inflate the count and produce per-path failures.
               const drop = {};
-              for (const item of store.get().items) drop[item.path] = true;
+              for (const item of store.get().items) drop[item.path] = !isProtected(item);
               store.set({ drop, armed: false });
             },
           }, tr('deleteAll')));

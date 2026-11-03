@@ -21,6 +21,9 @@
     "cleanup",
     "temporary-files"
   ],
+  "scripts": {
+    "test": "node test/probe.mjs"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

@@ -83,12 +83,21 @@ Two same-origin POST routes connect the client button to the host:
 
 Scan results are cached in host memory for 10 minutes. Delete accepts only paths that appeared in that session's latest scan; anything else is rejected per path.
 
+## Tests
+
+```bash
+npm test        # same as node test/probe.mjs
+```
+
+`test/probe.mjs` is a behaviour probe with no external dependencies: it drives the real `apply()` with a fake context, builds a sandbox in the OS temp directory, and cleans up afterwards. It covers route method/origin/size validation, marking and default selection, the host-side refusal to delete protected files, `.git` and out-of-root rejections, cache invalidation after a delete, marker-tool filtering and rendering, and prompt-section registration.
+
 ## Safety boundaries
 
 - **Only scanned paths**: `paths` must come from this session's scan, or each entry fails
 - **Root allowlist**: a file must live in the session cwd, this session's spill directory, or be a file a command explicitly wrote under the OS temp root; only this session's own spill directory can be removed wholesale
-- **Deliverable protection**: files in `present` calls or deliverable records always start unticked
-- **Dependency protection**: files inside a directory resolved from a profile dependency (for example a plugin linked with `link:`) start unticked
+- **Deliverable protection**: files in `present` calls or deliverable records start unticked, and the host refuses to delete them (`protected`) regardless of what the client sent
+- **Dependency protection**: files inside a directory resolved from a profile dependency (for example a plugin linked with `link:`) start unticked, and the host refuses them too (`protected`)
+- **Protection reads the whole log**: delivered and repeat-edited files are judged from the full session log, so a deliverable from days ago cannot lose its protection just because the session logged something newer
 - **`.git` never appears**: any path with a `.git` segment is skipped, never listed, never deleted
 - **Two clicks**: no delete request is sent before the second click
 - **Never automatic**: the plugin deletes nothing on its own
@@ -120,6 +129,7 @@ client.js           browser side: button, panel, i18n
 cordis.patch.yml    patch that inserts this bundle into a profile
 locale/             plugin metadata, zh and en
 icon.svg            icon
+test/probe.mjs      behaviour probe (npm test)
 ```
 
 ## License

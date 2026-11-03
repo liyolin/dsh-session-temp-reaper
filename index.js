@@ -829,14 +829,20 @@ async function scan(sessionQuery, sessionId) {
     const snapshot = await sessionQuery.readSession(sessionId);
     const cwd = normalize(snapshot.session?.cwd ?? process.cwd());
     const startedAt = snapshot.session?.createdAt;
+    const allEvents = snapshot.events ?? [];
     // Marks come from the whole log: the model may have marked a file hours ago.
     // They outrank every heuristic below.
-    const marks = markedPaths(snapshot.events ?? [], cwd);
+    const marks = markedPaths(allEvents, cwd);
     const paths = new Map();
     for (const [absolute, entry] of marks) {
         if (isInside(cwd, absolute)) paths.set(absolute, entry);
     }
-    const events = recentEvents(snapshot.events ?? []);
+    // Candidate discovery stays on the recent tail, but the protection state
+    // must be read from the whole log: a `present` from days ago still means
+    // "delivered", and a file edited long ago is still maintained. Reading
+    // those from the window let an old deliverable lose its protection as soon
+    // as the session logged anything newer.
+    const events = recentEvents(allEvents);
     const targets = eventTargets(events, cwd);
     for (const [absolute, entry] of targets) {
         if (isInside(cwd, absolute) && !paths.has(absolute)) paths.set(absolute, entry);
@@ -863,8 +869,8 @@ async function scan(sessionQuery, sessionId) {
         paths,
         startedAt,
         await referencedPackageRoots(),
-        deliveredPaths(events, cwd),
-        touchCounts(events, cwd),
+        deliveredPaths(allEvents, cwd),
+        touchCounts(allEvents, cwd),
     );
     const spill = await listSpill(sessionId);
     const items = [...files, ...spill].sort((a, b) => a.display.localeCompare(b.display));
@@ -931,6 +937,13 @@ async function removeFiles(sessionQuery, sessionId, requested) {
         const item = offered.get(absolute);
         if (item === undefined) {
             results.push({ path: absolute, ok: false, code: 'not-offered' });
+            continue;
+        }
+        // Delivered and in-use files are refused by the host, not merely
+        // unticked by the client: `keepByDefault` is a UI default, and a
+        // request can arrive with every path selected.
+        if (item.delivered === true || item.referenced === true) {
+            results.push({ path: absolute, ok: false, code: 'protected' });
             continue;
         }
         // The scan is the allowlist. Beyond it, the only reachable places are
