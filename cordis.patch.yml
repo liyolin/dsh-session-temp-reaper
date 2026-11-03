@@ -1,0 +1,4 @@
+# dsh bundle patch: adds this plugin to the profile's layer stack.
+- insert:
+    - id: session-temp-reaper
+      name: 'dsh-session-temp-reaper'

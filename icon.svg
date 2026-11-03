@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Session temp cleaner">
+  <defs>
+    <linearGradient id="strBag" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4aa3ff"/>
+      <stop offset="1" stop-color="#1f5fd0"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="16" fill="#101827"/>
+  <g fill="none" stroke="url(#strBag)" stroke-width="3" stroke-linecap="round">
+    <path d="M22 22h20"/>
+    <path d="M27 18h10"/>
+    <path d="M24 22l1.6 22a3 3 0 0 0 3 2.8h6.8a3 3 0 0 0 3-2.8L40 22"/>
+    <path d="M30 29v12"/>
+    <path d="M34 29v12"/>
+  </g>
+  <circle cx="49" cy="17" r="3.4" fill="#7ee2b8"/>
+</svg>

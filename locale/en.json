@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Temp Cleaner",
+    "description": "Adds a button beside the composer that lists the files this session generated and deletes the ones you choose not to keep."
+  }
+}
