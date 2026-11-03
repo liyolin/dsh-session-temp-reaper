@@ -38,6 +38,9 @@ window.__ModuleLoader__.load({
       '.str-row.locked{opacity:.62;background:color-mix(in srgb,var(--dsw-alias-bg-layer-2) 55%,transparent)}',
       '.str-row.locked:hover{background:color-mix(in srgb,var(--dsw-alias-bg-layer-2) 55%,transparent)}',
       '.str-row.locked .str-check{cursor:not-allowed}',
+      '.str-warn{margin:0 0 8px;padding:7px 9px;border-radius:8px;font-size:11px;line-height:1.45;'
+        + 'color:var(--dsw-alias-label-primary);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 16%,transparent);'
+        + 'box-shadow:inset 2px 0 0 var(--dsw-alias-state-warn-primary)}',
       '.str-main{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:1px}',
       '.str-line1{display:flex;align-items:center;gap:6px;min-width:0}',
       '.str-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}',
@@ -117,7 +120,10 @@ window.__ModuleLoader__.load({
         'action.delete': '删除 {n} 个',
         'action.confirm': '再点一次确认删除 {n} 个',
         'error.scan': '扫描失败，请重试',
+        'error.scanTimeout': '扫描超时（60 秒）。工作区可能太大，可再试一次',
         'error.delete': '删除失败，请重试',
+        'error.deleteTimeout': '删除请求超时（60 秒），结果未知 —— 请重新打开面板确认哪些文件真的没了',
+        'panel.profileUnknown': '没能定位 DSH profile，无法确认哪些文件正被插件使用。删除前请自行确认这些文件不属于任何插件。',
         'done.title': '清理结果',
         'done.summary': '已删除 {removed} 个，失败 {failed} 个',
         'done.none': '没有删除任何文件',
@@ -193,7 +199,10 @@ window.__ModuleLoader__.load({
         'action.delete': 'Delete {n}',
         'action.confirm': 'Click again to delete {n}',
         'error.scan': 'Scan failed, try again',
+        'error.scanTimeout': 'Scan timed out after 60s. The workspace may be too large; try again',
         'error.delete': 'Delete failed, try again',
+        'error.deleteTimeout': 'Delete timed out after 60s and the result is unknown — reopen the panel to see what is actually gone',
+        'panel.profileUnknown': 'The DSH profile could not be located, so plugin dependencies could not be checked. Confirm these files are not part of a plugin before deleting.',
         'done.title': 'Result',
         'done.summary': 'Deleted {removed}, failed {failed}',
         'done.none': 'Nothing was deleted',
@@ -304,6 +313,9 @@ window.__ModuleLoader__.load({
       removed: 0,
       // The unmarked group starts collapsed: it is context, not candidates.
       showUnmarked: false,
+      // False when the host could not locate the profile, so dependency
+      // protection could not be evaluated. The panel says so.
+      profileKnown: true,
     };
 
     function createStore(initial) {
@@ -408,19 +420,35 @@ window.__ModuleLoader__.load({
       return function () { tag.remove(); };
     }
 
+    // A scan can walk a large workspace and a delete can touch many files, so a
+    // stuck host must not leave the panel spinning forever.
+    const REQUEST_TIMEOUT_MS = 60_000;
+
+    function timeoutSignal() {
+      if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+        return AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+      }
+      return undefined;
+    }
+
     async function post(path, payload) {
       const response = await fetch(path, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         cache: 'no-store',
+        signal: timeoutSignal(),
         body: JSON.stringify(payload),
       });
       const body = await response.json().catch(() => null);
       return { status: response.status, body };
     }
 
+    function isAbort(error) {
+      return error !== null && typeof error === 'object' && (error.name === 'AbortError' || error.name === 'TimeoutError');
+    }
+
     async function scanSession(sessionId) {
-      store.set({ phase: 'loading', error: null, results: null, armed: false, items: [], drop: {} });
+      store.set({ phase: 'loading', error: null, results: null, armed: false, items: [], drop: {}, profileKnown: true });
       try {
         const { status, body } = await post('/session-temp-reaper/scan', { sessionId });
         if (status !== 200 || body === null || body.ok !== true) {
@@ -433,10 +461,10 @@ window.__ModuleLoader__.load({
         // for exactly those files.
         const drop = {};
         for (const item of items) drop[item.path] = item.keepByDefault !== true;
-        store.set({ phase: 'ready', items, drop });
+        store.set({ phase: 'ready', items, drop, profileKnown: body.profileKnown !== false });
       }
       catch (error) {
-        store.set({ phase: 'error', error: tr('error.scan') });
+        store.set({ phase: 'error', error: isAbort(error) ? tr('error.scanTimeout') : tr('error.scan') });
       }
     }
 
@@ -537,7 +565,9 @@ window.__ModuleLoader__.load({
         });
       }
       catch (error) {
-        store.set({ busy: false, error: tr('error.delete') });
+        // A timed-out delete may still have completed on the host, so the text
+        // must not claim that nothing was removed.
+        store.set({ busy: false, error: isAbort(error) ? tr('error.deleteTimeout') : tr('error.delete') });
       }
     }
 
@@ -659,13 +689,16 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         if (!state.open) return undefined;
+        // Closing stays possible while a request is in flight: a stuck host
+        // must not trap the panel. A second delete is still impossible because
+        // the button is only reachable inside the open panel.
         function onKey(event) {
-          if (event.key === 'Escape' && !store.get().busy) closePanel();
+          if (event.key === 'Escape') closePanel();
         }
         function onPointerDown(event) {
           const target = event.target;
           if (target && target.closest && (target.closest('.str-panel') || target.closest('.str-trigger'))) return;
-          if (!store.get().busy) closePanel();
+          closePanel();
         }
         document.addEventListener('keydown', onKey);
         document.addEventListener('pointerdown', onPointerDown, true);
@@ -688,6 +721,9 @@ window.__ModuleLoader__.load({
       const markedItems = state.items.filter((item) => item.marked === true);
       const unmarkedItems = state.items.filter((item) => item.marked !== true);
       const body = [];
+      if (state.phase === 'ready' && state.profileKnown === false) {
+        body.push(h('div', { key: 'profileUnknown', className: 'str-warn' }, tr('panel.profileUnknown')));
+      }
       if (state.phase === 'loading') {
         body.push(h('div', { key: 'loading', className: 'str-empty' }, tr('panel.loading')));
       }
@@ -767,7 +803,6 @@ window.__ModuleLoader__.load({
             type: 'button',
             className: 'str-btn',
             onClick: closePanel,
-            disabled: state.busy === true,
           }, tr('action.cancel')),
           h('button', {
             key: 'delete',

@@ -1,154 +1,32 @@
-// Behaviour probe for dsh-session-temp-reaper.
-//
-// Drives `apply()` with a fake Cordis context: a fake webServer captures the two
-// routes, a fake sessionQuery replays a hand-built session log, and a fake
-// tools / systemPrompt host captures the marker tool and the prompt section.
-// Everything runs against a throwaway sandbox in the OS temp directory.
+// Behaviour probe for dsh-session-temp-reaper (no profile discoverable).
 //
 // Run: node test/probe.mjs
-import { mkdtemp, mkdir, writeFile, rm, stat } from 'node:fs/promises';
+//
+// `DSH_PROFILE_DIR` is injected for shell tools but is not set for the desktop
+// host process, so a probe that inherits it would silently test a different
+// code path. This file clears it on purpose; the known-profile path is covered
+// by `test/profile-probe.mjs`.
+delete process.env.DSH_PROFILE_DIR;
+
+import { mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { apply } from '../index.js';
+import {
+    HOUR,
+    MIN,
+    ROUTE,
+    assert,
+    call,
+    call_,
+    eq,
+    exists,
+    sandbox,
+    sandboxMany,
+    summary,
+    test,
+} from './harness.mjs';
 
-const ROUTE = '/session-temp-reaper';
-const HOUR = 60 * 60 * 1000;
-const MIN = 60 * 1000;
-
-let passed = 0;
-const failed = [];
-
-async function test(name, fn) {
-    try {
-        await fn();
-        passed += 1;
-        console.log(`PASS  ${name}`);
-    }
-    catch (error) {
-        failed.push({ name, error });
-        console.log(`FAIL  ${name}\n      ${error.message}`);
-    }
-}
-
-function assert(condition, message) {
-    if (!condition) throw new Error(message);
-}
-
-function eq(actual, expected, message) {
-    if (actual !== expected) {
-        throw new Error(`${message}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
-    }
-}
-
-/** A session-log tool call. */
-function call_(name, args, time) {
-    return { type: 'tool/call', time, data: { name, arguments: JSON.stringify(args) } };
-}
-
-async function exists(path) {
-    try {
-        await stat(path);
-        return true;
-    }
-    catch {
-        return false;
-    }
-}
-
-function mount({ sessionId, cwd, createdAt, events }) {
-    const state = { routes: new Map(), tool: null, section: null, readCount: 0 };
-    const host = {
-        effect(fn) {
-            const disposer = fn();
-            state.disposer = disposer;
-            return disposer;
-        },
-        webServer: {
-            register(spec) {
-                state.routes.set(spec.path, spec.handler);
-                return () => state.routes.delete(spec.path);
-            },
-        },
-        sessionQuery: {
-            async readSession(id) {
-                state.readCount += 1;
-                if (id !== sessionId) throw new Error(`session "${id}" not found`);
-                return { session: { cwd, createdAt }, events };
-            },
-        },
-        tools: {
-            register(definition) {
-                state.tool = definition;
-                return () => {};
-            },
-        },
-        systemPrompt: {
-            section(definition) {
-                state.section = definition;
-                return () => {};
-            },
-        },
-    };
-    const ctx = {
-        inject(names, callback) {
-            const picked = { effect: host.effect };
-            for (const name of names) picked[name] = host[name];
-            callback(picked);
-        },
-    };
-    apply(ctx);
-    return state;
-}
-
-/** POST to a captured route, returning parsed JSON and the status code. */
-async function call(state, route, { method = 'POST', body, origin, raw } = {}) {
-    const handler = state.routes.get(route);
-    if (handler === undefined) throw new Error(`route not registered: ${route}`);
-    const payload = raw !== undefined ? raw : body === undefined ? '' : JSON.stringify(body);
-    const request = {
-        method,
-        headers: { host: '127.0.0.1:2465' },
-        async *[Symbol.asyncIterator]() {
-            if (payload !== '') yield Buffer.from(payload, 'utf8');
-        },
-    };
-    if (origin !== undefined) request.headers.origin = origin;
-    const response = {
-        status: 0,
-        headers: {},
-        text: '',
-        writeHead(status, headers) {
-            this.status = status;
-            Object.assign(this.headers, headers ?? {});
-        },
-        end(text) {
-            this.text = text ?? '';
-        },
-    };
-    await handler(request, response);
-    let json = null;
-    try {
-        json = response.text === '' ? null : JSON.parse(response.text);
-    }
-    catch {
-        json = { unparsable: response.text };
-    }
-    return { status: response.status, json };
-}
-
-/** Sandbox plus a scan/delete pair wired to one session id. */
-async function sandbox(events, { createdAt = Date.now() - HOUR, sessionId = 'session-probe-001' } = {}) {
-    const cwd = await mkdtemp(join(tmpdir(), 'reaper-probe-'));
-    const state = mount({ sessionId, cwd, createdAt, events: typeof events === 'function' ? events(cwd) : events });
-    return {
-        cwd,
-        state,
-        sessionId,
-        scan: () => call(state, `${ROUTE}/scan`, { body: { sessionId } }),
-        del: (paths) => call(state, `${ROUTE}/delete`, { body: { sessionId, paths } }),
-        cleanup: () => rm(cwd, { recursive: true, force: true }),
-    };
-}
+// ── routes ────────────────────────────────────────────────────────────────────
 
 // ── routes ────────────────────────────────────────────────────────────────────
 
@@ -421,11 +299,34 @@ await test('marker tool ignores .git paths and empty strings', async () => {
     try {
         const tool = box.state.tool;
         assert(tool !== null, 'tool should be registered');
-        const value = await tool.execute({ paths: ['a.txt', '.git/config', '', 'b.txt'] });
+        const value = await tool.execute({ paths: ['a.txt', '.git/config', '', 'b.txt'] }, { agent: { id: box.sessionId } });
         assert(value.marked.includes('a.txt'), 'a.txt marked');
         assert(value.marked.includes('b.txt'), 'b.txt marked');
         assert(!value.marked.some((path) => path.includes('.git')), '.git path must be ignored');
         eq(value.ignored.length, 2, 'ignored count');
+        eq(value.ignored.find((entry) => entry.reason === 'git').path, '.git/config', 'git reason');
+        eq(value.ignored.find((entry) => entry.reason === 'empty').path, '', 'empty reason');
+    }
+    finally {
+        await box.cleanup();
+    }
+});
+
+await test('TMP-05: marker tool refuses paths outside the session cwd and says why', async () => {
+    const box = await sandbox([]);
+    try {
+        const tool = box.state.tool;
+        assert(tool !== null, 'tool should be registered');
+        const outside = join(tmpdir(), 'reaper-outside-probe.txt');
+        const value = await tool.execute(
+            { paths: ['inside.tmp', outside] },
+            { agent: { id: box.sessionId } },
+        );
+        eq(value.marked.length, 1, 'only the in-cwd path is marked');
+        eq(value.marked[0], 'inside.tmp', 'marked path');
+        eq(value.ignored.length, 1, 'ignored count');
+        eq(value.ignored[0].path, outside, 'ignored path');
+        eq(value.ignored[0].reason, 'outside-cwd', 'ignored reason');
     }
     finally {
         await box.cleanup();
@@ -458,10 +359,60 @@ await test('prompt section is registered once, last', async () => {
     }
 });
 
-// ── summary ───────────────────────────────────────────────────────────────────
+// ── TMP-06: the scan cache must be bounded ────────────────────────────────────
 
-console.log(`\n${passed} passed, ${failed.length} failed`);
-if (failed.length > 0) {
-    for (const { name, error } of failed) console.log(`  - ${name}: ${error.message}`);
-    process.exitCode = 1;
-}
+await test('TMP-06: the oldest sessions are evicted from the scan cache', async () => {
+    const box = await sandboxMany(70);
+    try {
+        for (const id of box.ids) {
+            const { status } = await box.scan(id);
+            eq(status, 200, `scan ${id}`);
+        }
+        eq(box.reads(box.ids[0]), 1, 'first session read once by its own scan');
+        // The first session has been evicted, so delete must rescan it.
+        const oldest = box.ids[0];
+        const oldestCwd = box.sessions.get(oldest).cwd;
+        await box.del(oldest, [join(oldestCwd, 'f0.txt')]);
+        eq(box.reads(oldest), 2, 'evicted session is rescanned on delete');
+        // The newest session is still cached: delete must not rescan it.
+        const newest = box.ids[box.ids.length - 1];
+        const newestCwd = box.sessions.get(newest).cwd;
+        const { json } = await box.del(newest, [join(newestCwd, `f${box.ids.length - 1}.txt`)]);
+        eq(json.removed, 1, 'newest delete succeeds');
+        eq(box.reads(newest), 1, 'recent session stays cached');
+    }
+    finally {
+        await box.cleanup();
+    }
+});
+
+// ── TMP-04: an undiscoverable profile must not silently drop protection ──────
+
+await test('TMP-04: no discoverable profile yields referenced=unknown and profileKnown=false', async () => {
+    const now = Date.now();
+    const box = await sandbox((cwd) => [
+        call_('write', { path: join(cwd, 'maybe-dep.js') }, now - 10 * MIN),
+        call_('mark_temp_files', { paths: ['maybe-dep.js'] }, now - 9 * MIN),
+    ]);
+    try {
+        // The probe clears DSH_PROFILE_DIR and its cwd/argv point at the plugin,
+        // so no profile manifest is discoverable.
+        await writeFile(join(box.cwd, 'maybe-dep.js'), 'x', 'utf8');
+        const { json } = await box.scan();
+        eq(json.profileKnown, false, 'profileKnown');
+        const item = json.items.find((entry) => entry.display === 'maybe-dep.js');
+        assert(item !== undefined, 'file should be listed');
+        eq(item.referenced, 'unknown', 'referenced');
+        // Unknown is reported, not turned into silent protection: the marked
+        // file keeps its default-delete state and the panel warns about it.
+        eq(item.keepByDefault, false, 'marked file keeps its default');
+        const { json: deleted } = await box.del([item.path]);
+        eq(deleted.removed, 1, 'unknown is not host-refused');
+    }
+    finally {
+        await box.cleanup();
+    }
+});
+
+
+summary();

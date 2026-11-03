@@ -58,6 +58,26 @@ const SCAN_TTL_MS = 10 * 60 * 1000;
 /** Scans by session id, so the delete route validates against what was offered. */
 const scans = new Map();
 
+/**
+ * Upper bound on cached scans. The TTL alone only expires an entry when that
+ * same session is visited again, so sessions that were scanned once and never
+ * reopened would stay in memory for the lifetime of the process.
+ */
+const SCAN_MAX_ENTRIES = 64;
+
+/** Drop expired entries, then the oldest ones past the cap. */
+function trimScans() {
+    const now = Date.now();
+    for (const [id, record] of scans) {
+        if (now - record.at > SCAN_TTL_MS) scans.delete(id);
+    }
+    while (scans.size > SCAN_MAX_ENTRIES) {
+        const oldest = scans.keys().next().value;
+        if (oldest === undefined) break;
+        scans.delete(oldest);
+    }
+}
+
 function validSessionId(value) {
     return typeof value === 'string' && value !== '' && value.length <= 200
         && /^[0-9A-Za-z_.:-]+$/.test(value);
@@ -631,7 +651,7 @@ async function externalTempFiles(cwd, targets, sessionStartedAt) {
  * should be deleted. Resolving the profile's dependency list to real paths is
  * what makes "referenced by the running profile" a fact rather than a guess.
  */
-let referencedCache = { at: 0, roots: [] };
+let referencedCache = { at: 0, roots: null };
 const REFERENCED_TTL_MS = 60_000;
 
 /** Walk up from a resolved entry file to the directory owning its package.json. */
@@ -694,38 +714,43 @@ async function referencedPackageRoots() {
     if (now - referencedCache.at < REFERENCED_TTL_MS) return referencedCache.roots;
     const roots = new Set();
     const found = readProfileManifest();
-    if (found !== null) {
-        const names = new Set([
-            ...Object.keys(found.manifest.dependencies ?? {}),
-            ...Object.keys(found.manifest.devDependencies ?? {}),
-        ]);
-        let requireFrom = null;
-        try {
-            requireFrom = createRequire(found.manifestPath);
-        }
-        catch {
-            requireFrom = null;
-        }
-        for (const name of names) {
-            if (requireFrom === null) break;
-            let entry = null;
-            for (const attempt of [`${name}/package.json`, name]) {
-                try {
-                    entry = requireFrom.resolve(attempt);
-                    break;
-                }
-                catch {
-                    // Exported subpaths may hide package.json; try the bare name.
-                }
-            }
-            if (entry === null) continue;
-            const root = normalize(packageRootFrom(entry) ?? dirname(entry));
+    // No discoverable profile manifest means "cannot tell", not "nothing is
+    // referenced": returning an empty list would silently drop the protection
+    // and make the panel claim every file is safe to delete.
+    if (found === null) {
+        referencedCache = { at: now, roots: null };
+        return null;
+    }
+    const names = new Set([
+        ...Object.keys(found.manifest.dependencies ?? {}),
+        ...Object.keys(found.manifest.devDependencies ?? {}),
+    ]);
+    let requireFrom = null;
+    try {
+        requireFrom = createRequire(found.manifestPath);
+    }
+    catch {
+        requireFrom = null;
+    }
+    for (const name of names) {
+        if (requireFrom === null) break;
+        let entry = null;
+        for (const attempt of [`${name}/package.json`, name]) {
             try {
-                roots.add(normalize(await realpath(root)));
+                entry = requireFrom.resolve(attempt);
+                break;
             }
             catch {
-                roots.add(root);
+                // Exported subpaths may hide package.json; try the bare name.
             }
+        }
+        if (entry === null) continue;
+        const root = normalize(packageRootFrom(entry) ?? dirname(entry));
+        try {
+            roots.add(normalize(await realpath(root)));
+        }
+        catch {
+            roots.add(root);
         }
     }
     referencedCache = { at: now, roots: [...roots] };
@@ -758,8 +783,12 @@ async function listFiles(cwd, paths, sessionStartedAt, referencedRoots, delivere
             : info.mtimeMs;
         const { preview, binary } = await readPreview(absolute);
         // Linked into the running profile: deleting it breaks a plugin or a
-        // dependency, so it is protected even when marked.
-        const referenced = referencedRoots.some((root) => isInside(root, absolute));
+        // dependency, so it is protected even when marked. `null` roots mean
+        // the profile could not be located, which is reported as 'unknown'
+        // rather than as "not referenced".
+        const referenced = referencedRoots === null
+            ? 'unknown'
+            : referencedRoots.some((root) => isInside(root, absolute));
         const unattributed = entry.source === 'scan';
         // Explicitly handed to the user: a result, never scratch.
         const isDelivered = delivered.has(absolute);
@@ -788,8 +817,12 @@ async function listFiles(cwd, paths, sessionStartedAt, referencedRoots, delivere
             // proposed for deletion, with delivered/profile-referenced files
             // still protected. Everything the model did NOT mark is only
             // context for the user and is proposed for keeping.
+            // The model's own mark is the definition of "temporary": those are
+            // proposed for deletion, with delivered/profile-referenced files
+            // still protected. Everything the model did NOT mark is only
+            // context for the user and is proposed for keeping.
             keepByDefault: marked
-                ? (isDelivered || referenced)
+                ? (isDelivered || referenced === true)
                 : true,
         });
     }
@@ -864,19 +897,51 @@ async function scan(sessionQuery, sessionId) {
     for (const [absolute, entry] of await externalTempFiles(cwd, targets, startedAt)) {
         if (!paths.has(absolute)) paths.set(absolute, entry);
     }
+    const referencedRoots = await referencedPackageRoots();
     const files = await listFiles(
         cwd,
         paths,
         startedAt,
-        await referencedPackageRoots(),
+        referencedRoots,
         deliveredPaths(allEvents, cwd),
         touchCounts(allEvents, cwd),
     );
     const spill = await listSpill(sessionId);
     const items = [...files, ...spill].sort((a, b) => a.display.localeCompare(b.display));
-    const record = { at: Date.now(), cwd, items };
+    // `profileKnown: false` means the profile could not be located, so the
+    // dependency protection could not be evaluated. The panel says so out loud
+    // instead of pretending every listed file is unreferenced.
+    const record = { at: Date.now(), cwd, items, profileKnown: referencedRoots !== null };
     scans.set(sessionId, record);
+    trimScans();
     return record;
+}
+
+/**
+ * The session's working directory, for validating `mark_temp_files` arguments.
+ * Cached briefly because the marker tool runs on every mark call, while the
+ * cwd only changes when a session is forked into another workspace.
+ */
+const sessionCwdCache = new Map();
+const SESSION_CWD_TTL_MS = 5 * 60 * 1000;
+
+async function sessionCwdFor(sessionQuery, sessionId) {
+    if (typeof sessionId !== 'string' || sessionId === '') return null;
+    const cached = sessionCwdCache.get(sessionId);
+    if (cached !== undefined && Date.now() - cached.at < SESSION_CWD_TTL_MS) return cached.cwd;
+    let cwd = null;
+    try {
+        const snapshot = await sessionQuery.readSession(sessionId);
+        const raw = snapshot?.session?.cwd;
+        cwd = typeof raw === 'string' && raw !== '' ? normalize(raw) : null;
+    }
+    catch {
+        // Unknown session: the tool keeps its previous permissive behaviour
+        // rather than refusing every mark.
+        cwd = null;
+    }
+    sessionCwdCache.set(sessionId, { at: Date.now(), cwd });
+    return cwd;
 }
 
 function cachedScan(sessionId) {
@@ -886,6 +951,9 @@ function cachedScan(sessionId) {
         scans.delete(sessionId);
         return null;
     }
+    // Refresh insertion order so the LRU trim keeps recently used scans.
+    scans.delete(sessionId);
+    scans.set(sessionId, record);
     return record;
 }
 
@@ -1034,7 +1102,7 @@ export function apply(ctx) {
             const disposers = [
                 route(`${ROUTE}/scan`, async (sessionId) => {
                     const record = await scan(host.sessionQuery, sessionId);
-                    return { cwd: record.cwd, items: record.items };
+                    return { cwd: record.cwd, items: record.items, profileKnown: record.profileKnown !== false };
                 }),
                 route(`${ROUTE}/delete`, async (sessionId, body) => {
                     const requested = Array.isArray(body?.paths) ? body.paths : [];
@@ -1052,7 +1120,7 @@ export function apply(ctx) {
     // The model defines "temporary" for this session by calling the marker; the
     // call itself is a normal tool call, so the marks replay with the session log
     // and show up in the transcript.
-    ctx.inject(['tools'], (toolHost) => {
+    ctx.inject(['tools', 'sessionQuery'], (toolHost) => {
         toolHost.effect(() => toolHost.tools.register({
             name: MARK_TOOL,
             description: 'Mark files created during this session that are temporary or intermediate '
@@ -1080,32 +1148,56 @@ export function apply(ctx) {
                     type: 'object',
                     properties: {
                         marked: { type: 'array', items: { type: 'string' } },
-                        ignored: { type: 'array', items: { type: 'string' } },
+                        ignored: {
+                            type: 'array',
+                            items: {
+                                type: 'object',
+                                properties: {
+                                    path: { type: 'string' },
+                                    reason: { type: 'string' },
+                                },
+                                required: ['path', 'reason'],
+                                additionalProperties: false,
+                            },
+                        },
                     },
                     required: ['marked', 'ignored'],
                     additionalProperties: false,
                 },
                 render: (args, value) => [{
                     type: 'text',
-                    text: `Marked ${value.marked.length} temporary file(s).`,
+                    text: value.ignored.length === 0
+                        ? `Marked ${value.marked.length} temporary file(s).`
+                        : `Marked ${value.marked.length} temporary file(s), ignored ${value.ignored.length}.`,
                 }],
             },
-            execute: async (args) => {
+            execute: async (args, exec) => {
                 const requested = Array.isArray(args?.paths) ? args.paths : [];
+                // The panel only lists paths inside the session working directory,
+                // so a mark outside it would never appear there. Refuse it here,
+                // with a reason the model can act on, instead of accepting it and
+                // dropping it silently during the scan.
+                const cwd = await sessionCwdFor(toolHost.sessionQuery, exec?.agent?.id);
                 const marked = [];
                 const ignored = [];
                 for (const raw of requested) {
                     if (typeof raw !== 'string' || raw.trim() === '') {
-                        ignored.push(String(raw));
+                        ignored.push({ path: typeof raw === 'string' ? raw : String(raw), reason: 'empty' });
                         continue;
                     }
-                    // Relative paths are resolved later against the session
-                    // working directory, which the tool context does not carry.
-                    if (hasGitSegment(raw)) {
-                        ignored.push(raw);
+                    const path = raw.trim();
+                    if (hasGitSegment(path)) {
+                        ignored.push({ path, reason: 'git' });
                         continue;
                     }
-                    marked.push(raw.trim());
+                    if (cwd !== null) {
+                        const absolute = normalize(isAbsolute(path) ? path : resolve(cwd, path));
+                        if (!isInside(cwd, absolute)) {
+                            ignored.push({ path, reason: 'outside-cwd' });
+                            continue;
+                        }
+                    }
+                    marked.push(path);
                 }
                 return { marked, ignored };
             },

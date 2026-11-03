@@ -68,7 +68,12 @@ mark_temp_files({
 })
 ```
 
-Returns `Marked N temporary file(s).` Marks exist only as a `tool/call` entry in the session log, so they travel with the session and need no extra state file. Re-marking a path in the same session is idempotent.
+Returns `{ marked, ignored }`:
+
+- `marked` — paths that were accepted
+- `ignored` — rejected paths with a reason: `git` (inside `.git`), `empty` (empty string), `outside-cwd` (not inside the session working directory, which the panel never lists anyway)
+
+Marks exist only as a `tool/call` entry in the session log, so they travel with the session and need no extra state file. Re-marking a path in the same session is idempotent.
 
 **Do not mark** deliverables the user asked for, or existing source files that were edited. The `present` and dependency-root protections would catch those anyway, but that is a backstop, not the intent.
 
@@ -89,7 +94,7 @@ Scan results are cached in host memory for 10 minutes. Delete accepts only paths
 npm test        # same as node test/probe.mjs
 ```
 
-`test/probe.mjs` is a behaviour probe with no external dependencies: it drives the real `apply()` with a fake context, builds a sandbox in the OS temp directory, and cleans up afterwards. It covers route method/origin/size validation, marking and default selection, the host-side refusal to delete protected files, `.git` and out-of-root rejections, cache invalidation after a delete, marker-tool filtering and rendering, and prompt-section registration.
+`test/probe.mjs` is a behaviour probe with no external dependencies: it drives the real `apply()` with a fake context, builds a sandbox in the OS temp directory, and cleans up afterwards. It covers route method/origin/size validation, marking and default selection, the host-side refusal to delete protected files, `.git` and out-of-root rejections, cache invalidation after a delete, LRU eviction of the scan cache, marker-tool filtering and rendering, the undiscoverable-profile warning, and prompt-section registration.
 
 ## Safety boundaries
 
@@ -101,6 +106,8 @@ npm test        # same as node test/probe.mjs
 - **`.git` never appears**: any path with a `.git` segment is skipped, never listed, never deleted
 - **Two clicks**: no delete request is sent before the second click
 - **Never automatic**: the plugin deletes nothing on its own
+- **No dangling requests**: requests time out after 60 seconds and the panel can still be closed; a timed-out delete says the result is unknown instead of implying nothing was removed
+- **Bounded cache**: scan results are cached per session for 10 minutes, at most 64 entries with LRU eviction
 
 ## Scan sources (the unmarked group)
 
@@ -119,7 +126,9 @@ The event window covers the last 72 hours of the session log; the workspace walk
 - If the model never calls `mark_temp_files`, the marked group is empty — only the unmarked group remains, and nothing is deleted by default
 - When concurrent sessions write into the same workspace, `scan`-sourced entries are guessed from a time window and carry an "unconfirmed" badge
 - Packages referenced only in `cordis.patch.yml` (not in profile `dependencies`) are not recognised as "in use"
+- When the profile cannot be located the panel warns that plugin dependencies could not be checked instead of pretending the protection is active
 - Deletion is permanent; there is no trash
+- The HTTP routes are not wired into the DSH auth layer, so they are for loopback use only (see TMP-01 in the handover notes)
 
 ## Layout
 
@@ -130,6 +139,7 @@ cordis.patch.yml    patch that inserts this bundle into a profile
 locale/             plugin metadata, zh and en
 icon.svg            icon
 test/probe.mjs      behaviour probe (npm test)
+test/harness.mjs    fake ctx / fake session log / sandbox helpers
 ```
 
 ## License
