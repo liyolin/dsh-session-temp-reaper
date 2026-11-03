@@ -316,6 +316,10 @@ window.__ModuleLoader__.load({
       // False when the host could not locate the profile, so dependency
       // protection could not be evaluated. The panel says so.
       profileKnown: true,
+      // Generation of this panel view. A response may only touch the store when
+      // its generation is still the current one, so closing the panel (or
+      // reopening it on a new scan) cannot be overwritten by a late reply.
+      runId: 0,
     };
 
     function createStore(initial) {
@@ -447,12 +451,13 @@ window.__ModuleLoader__.load({
       return error !== null && typeof error === 'object' && (error.name === 'AbortError' || error.name === 'TimeoutError');
     }
 
-    async function scanSession(sessionId) {
+    async function scanSession(sessionId, runId) {
       store.set({ phase: 'loading', error: null, results: null, armed: false, items: [], drop: {}, profileKnown: true });
       try {
         // Exact Fetch routes on DSH's authenticated /api channel: the browser
         // cookie is checked by the Host before the handler runs.
         const { status, body } = await post('/api/session-temp-reaper/scan', { sessionId });
+        if (!isCurrentRun(runId)) return;
         if (status !== 200 || body === null || body.ok !== true) {
           store.set({ phase: 'error', error: tr('error.scan') });
           return;
@@ -466,18 +471,30 @@ window.__ModuleLoader__.load({
         store.set({ phase: 'ready', items, drop, profileKnown: body.profileKnown !== false });
       }
       catch (error) {
+        if (!isCurrentRun(runId)) return;
         store.set({ phase: 'error', error: isAbort(error) ? tr('error.scanTimeout') : tr('error.scan') });
       }
     }
 
     function openPanel(sessionId) {
       if (typeof sessionId !== 'string' || sessionId === '') return;
-      store.set(Object.assign({}, CLOSED, { open: true, sessionId }));
-      void scanSession(sessionId);
+      const runId = currentRunId() + 1;
+      store.set(Object.assign({}, CLOSED, { open: true, sessionId, runId }));
+      void scanSession(sessionId, runId);
     }
 
     function closePanel() {
-      store.set(CLOSED);
+      // Bump the generation so replies still in flight are dropped.
+      store.set(Object.assign({}, CLOSED, { runId: currentRunId() + 1 }));
+    }
+
+    function currentRunId() {
+      return store.get().runId ?? 0;
+    }
+
+    /** True while `runId` still describes the panel view that asked. */
+    function isCurrentRun(runId) {
+      return store.get().runId === runId;
     }
 
     // Delivered files and files inside a plugin or dependency the profile is
@@ -549,11 +566,15 @@ window.__ModuleLoader__.load({
         return;
       }
       store.set({ busy: true, error: null });
+      const runId = state.runId;
       try {
         const { status, body } = await post('/api/session-temp-reaper/delete', {
           sessionId: state.sessionId,
           paths,
         });
+        // The panel may have been closed and reopened while the delete flew; a
+        // late reply must not repaint the newer view.
+        if (!isCurrentRun(runId)) return;
         if (status !== 200 || body === null || body.ok !== true) {
           store.set({ busy: false, error: tr('error.delete') });
           return;
@@ -567,6 +588,7 @@ window.__ModuleLoader__.load({
         });
       }
       catch (error) {
+        if (!isCurrentRun(runId)) return;
         // A timed-out delete may still have completed on the host, so the text
         // must not claim that nothing was removed.
         store.set({ busy: false, error: isAbort(error) ? tr('error.deleteTimeout') : tr('error.delete') });

@@ -4,11 +4,11 @@
 //
 // `DSH_PROFILE_DIR` is injected for shell tools but is not set for the desktop
 // host process, so a probe that inherits it would silently test a different
-// code path. This file clears it on purpose; the known-profile path is covered
-// by `test/profile-probe.mjs`.
+// code path. This file clears it on purpose; the known-profile path is not
+// covered by an automated probe yet.
 delete process.env.DSH_PROFILE_DIR;
 
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -405,5 +405,92 @@ await test('TMP-04: no discoverable profile yields referenced=unknown and profil
     }
 });
 
+// ── N2: the session cwd cache must be bounded and released on unload ─────────
+
+await test('N2: the session cwd cache is dropped when the plugin unloads', async () => {
+    // A session id of its own: the cache is module level, so an id already
+    // used by an earlier probe would start warm.
+    const box = await sandbox([], { sessionId: 'session-n2-unload-001' });
+    try {
+        const tool = box.state.tool;
+        assert(tool !== null, 'tool should be registered');
+        const exec = { agent: { id: box.sessionId } };
+        await tool.execute({ paths: ['a.txt'] }, exec);
+        await tool.execute({ paths: ['a.txt'] }, exec);
+        eq(box.state.reads.get(box.sessionId), 1, 'second mark reuses the cached cwd');
+        // Unload the plugin: every disposer must run, and the cwd cache is not
+        // allowed to outlive it.
+        for (const dispose of box.state.disposers) if (typeof dispose === 'function') dispose();
+        await tool.execute({ paths: ['a.txt'] }, exec);
+        eq(box.state.reads.get(box.sessionId), 2, 'unload clears the cache');
+    }
+    finally {
+        await box.cleanup();
+    }
+});
+
+await test('N2: the session cwd cache does not grow without bound', async () => {
+    const box = await sandboxMany(70);
+    try {
+        const tool = box.state.tool;
+        assert(tool !== null, 'tool should be registered');
+        for (const id of box.ids) await tool.execute({ paths: ['x.txt'] }, { agent: { id } });
+        eq(box.reads(box.ids[0]), 1, 'first mark reads that session once');
+        // The cap is 64, so the oldest entry has been evicted and is reread.
+        await tool.execute({ paths: ['x.txt'] }, { agent: { id: box.ids[0] } });
+        eq(box.reads(box.ids[0]), 2, 'oldest entry evicted');
+        const newest = box.ids[box.ids.length - 1];
+        await tool.execute({ paths: ['x.txt'] }, { agent: { id: newest } });
+        eq(box.reads(newest), 1, 'recent entry stays cached');
+    }
+    finally {
+        await box.cleanup();
+    }
+});
+
+// ── N3: an oversized body must be refused without buffering all of it ────────
+
+await test('N3: an oversized streamed body is refused without draining it', async () => {
+    const box = await sandbox([]);
+    try {
+        const route = box.state.fetchRoutes.get(`${ROUTE}/scan`);
+        assert(route !== undefined, 'scan route missing');
+        const chunk = new TextEncoder().encode('x'.repeat(400_000));
+        let pulled = 0;
+        const body = new ReadableStream({
+            pull(controller) {
+                pulled += 1;
+                if (pulled >= 50) {
+                    controller.close();
+                    return;
+                }
+                controller.enqueue(chunk);
+            },
+        });
+        const request = new Request(`http://127.0.0.1:2465${ROUTE}/scan`, {
+            method: 'POST',
+            body,
+            duplex: 'half',
+        });
+        const response = await route.fetch(request);
+        eq(response.status, 400, 'status');
+        // 1 MB cap over 400 kB chunks: a streaming reader stops after a few
+        // chunks and cancels the stream instead of draining all 50.
+        assert(pulled <= 6, `must stop at the cap, pulled ${pulled} chunks`);
+    }
+    finally {
+        await box.cleanup();
+    }
+});
+
+// ── N5: the published package must ship what `npm test` runs ─────────────────
+
+await test('N5: the package ships the test files its test script needs', async () => {
+    const raw = await readFile(new URL('../package.json', import.meta.url), 'utf8');
+    const pkg = JSON.parse(raw);
+    if (typeof pkg.scripts?.test === 'string') {
+        assert(pkg.files.includes('test'), 'files must include "test" because scripts.test runs it');
+    }
+});
 
 summary();

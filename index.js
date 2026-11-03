@@ -925,10 +925,31 @@ async function scan(sessionQuery, sessionId) {
 const sessionCwdCache = new Map();
 const SESSION_CWD_TTL_MS = 5 * 60 * 1000;
 
+/** Same bound and eviction order as `scans`, for the same reason. */
+const SESSION_CWD_MAX_ENTRIES = 64;
+
+/** Drop expired entries, then the oldest ones past the cap. */
+function trimSessionCwdCache() {
+    const now = Date.now();
+    for (const [id, record] of sessionCwdCache) {
+        if (now - record.at > SESSION_CWD_TTL_MS) sessionCwdCache.delete(id);
+    }
+    while (sessionCwdCache.size > SESSION_CWD_MAX_ENTRIES) {
+        const oldest = sessionCwdCache.keys().next().value;
+        if (oldest === undefined) break;
+        sessionCwdCache.delete(oldest);
+    }
+}
+
 async function sessionCwdFor(sessionQuery, sessionId) {
     if (typeof sessionId !== 'string' || sessionId === '') return null;
     const cached = sessionCwdCache.get(sessionId);
-    if (cached !== undefined && Date.now() - cached.at < SESSION_CWD_TTL_MS) return cached.cwd;
+    if (cached !== undefined && Date.now() - cached.at < SESSION_CWD_TTL_MS) {
+        // Refresh insertion order so the LRU trim keeps the sessions in use.
+        sessionCwdCache.delete(sessionId);
+        sessionCwdCache.set(sessionId, cached);
+        return cached.cwd;
+    }
     let cwd = null;
     try {
         const snapshot = await sessionQuery.readSession(sessionId);
@@ -940,7 +961,10 @@ async function sessionCwdFor(sessionQuery, sessionId) {
         // rather than refusing every mark.
         cwd = null;
     }
+    // Re-insert so the LRU trim keeps the sessions in use.
+    sessionCwdCache.delete(sessionId);
     sessionCwdCache.set(sessionId, { at: Date.now(), cwd });
+    trimSessionCwdCache();
     return cwd;
 }
 
@@ -1024,9 +1048,35 @@ async function removeFiles(sessionQuery, sessionId, requested) {
 /** Requests are small JSON envelopes; anything bigger is a mistake or an attack. */
 const MAX_BODY_CHARS = 1_000_000;
 
+/**
+ * Read a bounded JSON body. The bridge already buffered the raw request, so the
+ * only thing to protect here is this second copy: read chunk by chunk and stop
+ * at the cap instead of turning an unbounded body into one giant string.
+ */
 async function readJson(request) {
-    const text = await request.text();
-    if (text.length > MAX_BODY_CHARS) throw new Error('request body too large');
+    const declared = Number.parseInt(request.headers.get('content-length') ?? '', 10);
+    if (Number.isFinite(declared) && declared > MAX_BODY_CHARS) {
+        throw new Error('request body too large');
+    }
+    if (request.body === null) return {};
+    const reader = request.body.getReader();
+    const decoder = new TextDecoder();
+    let text = '';
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            text += decoder.decode(value, { stream: true });
+            if (text.length > MAX_BODY_CHARS) {
+                await reader.cancel().catch(() => {});
+                throw new Error('request body too large');
+            }
+        }
+    }
+    finally {
+        reader.releaseLock();
+    }
+    text += decoder.decode();
     if (text === '') return {};
     return JSON.parse(text);
 }
@@ -1096,6 +1146,7 @@ export function apply(ctx) {
             ];
             return () => {
                 scans.clear();
+                sessionCwdCache.clear();
                 for (const dispose of disposers) void dispose();
             };
         }, 'session-temp-reaper: api routes');

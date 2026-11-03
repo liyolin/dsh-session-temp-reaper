@@ -64,11 +64,13 @@ export async function exists(path) {
 
 export function mount({ sessions, sessionId, cwd, createdAt, events }) {
     const known = sessions ?? new Map([[sessionId, { cwd, createdAt, events }]]);
-    const state = { fetchRoutes: new Map(), tool: null, section: null, reads: new Map() };
+    const state = { fetchRoutes: new Map(), tool: null, section: null, reads: new Map(), disposers: [] };
     const host = {
         effect(fn) {
             const disposer = fn();
-            state.disposer = disposer;
+            // Keep every disposer: a probe that unloads the plugin must run all
+            // of them, not just the last one registered.
+            state.disposers.push(disposer);
             return disposer;
         },
         // Exact Fetch routes on the authenticated `/api` channel. The fake only

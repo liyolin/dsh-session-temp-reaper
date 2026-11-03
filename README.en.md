@@ -90,13 +90,15 @@ Authentication belongs to DSH's `connection` layer: Host/Origin fencing and the 
 
 Scan results are cached in host memory for 10 minutes, at most 64 entries. Delete accepts only paths that appeared in that session's latest scan; anything else is rejected per path.
 
+The request body is capped at 1 MB and checked while it is read: an oversized body is cancelled and answered with 400 instead of being buffered into one string first.
+
 ## Tests
 
 ```bash
 npm test        # same as node test/probe.mjs
 ```
 
-`test/probe.mjs` is a behaviour probe with no external dependencies: it drives the real `apply()` with a fake context, builds a sandbox in the OS temp directory, and cleans up afterwards. It covers route registration (the `/api` prefix, POST only, no bare `webServer` route), method and body validation, marking and default selection, the host-side refusal to delete protected files, `.git` and out-of-root rejections, cache invalidation after a delete, LRU eviction of the scan cache, marker-tool filtering and rendering, the undiscoverable-profile warning, and prompt-section registration.
+`test/probe.mjs` is a behaviour probe with no external dependencies: it drives the real `apply()` with a fake context, builds a sandbox in the OS temp directory, and cleans up afterwards. It covers route registration (the `/api` prefix, POST only, no bare `webServer` route), method and body validation (including an oversized streamed body that must be abandoned mid-read), marking and default selection, the host-side refusal to delete protected files, `.git` and out-of-root rejections, cache invalidation after a delete, LRU eviction of the scan cache, the session-cwd cache bound and its release on unload, marker-tool filtering and rendering, the undiscoverable-profile warning, `package.json` shipping the `test` directory, and prompt-section registration.
 
 ## Safety boundaries
 
@@ -109,7 +111,7 @@ npm test        # same as node test/probe.mjs
 - **Two clicks**: no delete request is sent before the second click
 - **Never automatic**: the plugin deletes nothing on its own
 - **No dangling requests**: requests time out after 60 seconds and the panel can still be closed; a timed-out delete says the result is unknown instead of implying nothing was removed
-- **Bounded cache**: scan results are cached per session for 10 minutes, at most 64 entries with LRU eviction
+- **Bounded cache**: scan results are cached per session for 10 minutes, at most 64 entries with LRU eviction; the session-cwd cache used by the marker tool is capped the same way and cleared when the plugin unloads
 
 ## Scan sources (the unmarked group)
 
